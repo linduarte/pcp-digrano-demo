@@ -8,3 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
+# Ficha técnica do SCF
+fichas_tecnicas_scf.ndjson
