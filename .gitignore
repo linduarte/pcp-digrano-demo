@@ -10,3 +10,6 @@ wheels/
 .venv
 # Ficha técnica do SCF
 fichas_tecnicas_scf.ndjson
+
+# Variáveis de ambiente com dados sensíveis
+.env
