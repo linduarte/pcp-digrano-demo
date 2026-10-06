@@ -1,16 +1,21 @@
 """Script para sincronizar produtos do SCF para um arquivo NDJSON."""
 
 import json
+import os
 
 import pyodbc  # type: ignore
+from dotenv import load_dotenv
 
-# Configurações de Conexão ao SQL Server do SCF
-db_config = {
-    "driver": "{SQL Server}",
-    "server": "192.168.0.61",  # IP do SCF via VPN
-    "database": "SCF",  # Substituir pelo nome exato do banco
-    "user": "SCF_user",
-    "password": "As23fZxDcf5"
+# Carrega as variáveis de ambiente do ficheiro .env
+load_dotenv()
+
+# Configurações lidas do ambiente com valores padrão de segurança
+DB_CONFIG = {
+    "driver": os.getenv("SCF_DB_DRIVER", "SQL Server"),
+    "server": os.getenv("SCF_DB_SERVER", "192.168.0.61"),
+    "database": os.getenv("SCF_DB_NAME", "SCF"),
+    "user": os.getenv("SCF_DB_USER", "SCF_user"),
+    "password": os.getenv("SCF_DB_PASS", ""),
 }
 
 query_scf = """
@@ -46,14 +51,6 @@ LEFT JOIN dbo.linha l
 """
 
 
-db_config = {
-    "driver": "SQL Server",
-    "server": "192.168.0.61",
-    "database": "SCF",
-    "user": "SCF_user",
-    "password": "As23fZxDcf5"
-}
-
 query_scf = """
 SELECT 
     p.codigoInterno AS codigo_caixa,
@@ -85,21 +82,22 @@ FROM dbo.produtoGeral p
 LEFT JOIN dbo.linha l 
     ON p.linha = l.codigoInterno;
 """
+
 
 def executar_sincronizacao():
-    """Sincroniza os produtos do SCF para um arquivo NDJSON."""
-    # String de conexão sem risco de formatação incorreta de chaves
-    driver_str = "{" + db_config["driver"].strip("{}") + "}"
+    """Sincroniza os produtos do SCF para um ficheiro NDJSON."""
+    driver_str = "{" + DB_CONFIG["driver"].strip("{}") + "}"
     conn_str = (
         f"DRIVER={driver_str};"
-        f"SERVER={db_config['server']};"
-        f"DATABASE={db_config['database']};"
-        f"UID={db_config['user']};"
-        f"PWD={db_config['password']};"
+        f"SERVER={DB_CONFIG['server']};"
+        f"DATABASE={DB_CONFIG['database']};"
+        f"UID={DB_CONFIG['user']};"
+        f"PWD={DB_CONFIG['password']};"
     )
 
-    print(f"Conectando ao SQL Server em {db_config['server']}...")
-    with pyodbc.connect(conn_str) as conn:  # pylint: disable=no-member,c-extension-no-member
+    print(f"Conectando ao SQL Server em {DB_CONFIG['server']}...")
+    connect = getattr(pyodbc, "connect")
+    with connect(conn_str) as conn:
         cursor = conn.cursor()
         cursor.execute(query_scf)
         rows = cursor.fetchall()
@@ -120,7 +118,7 @@ def executar_sincronizacao():
                             "codigo_insumo": c.get("codigo_insumo", "").strip(),
                             "descricao_insumo": c.get("descricao_insumo", "").strip(),
                             "peso_unid_kg": float(c.get("peso_unid_kg", 0.0)),
-                            "unidade": c.get("unidade", "").strip()
+                            "unidade": c.get("unidade", "").strip(),
                         }
                         for c in comps
                     ]
@@ -132,14 +130,17 @@ def executar_sincronizacao():
                         "pct_por_cx": int(row.pct_por_cx),
                         "uni_por_pct": int(row.uni_por_pct),
                         "qtd_por_tabuleiro": int(row.qtd_por_tabuleiro),
-                        "composicoes": clean_comps
+                        "composicoes": clean_comps,
                     }
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     total_processado += 1
-                except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as e:
-                    print(f"Erro ao processar item {row.codigo_caixa}: {e}")
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"Erro ao processar item {row.codigo_caixa}: {exc}")
 
-        print(f"Sucesso! {total_processado} produtos sincronizados em '{arquivo_saida}'.")
+        print(
+            f"Sucesso! {total_processado} produtos sincronizados em '{arquivo_saida}'."
+        )
+
 
 if __name__ == "__main__":
     executar_sincronizacao()
