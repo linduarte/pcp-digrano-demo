@@ -118,7 +118,8 @@ def executar_sincronizacao():
                             "codigo_insumo": c.get("codigo_insumo", "").strip(),
                             "descricao_insumo": c.get("descricao_insumo", "").strip(),
                             "peso_unid_kg": float(c.get("peso_unid_kg", 0.0)),
-                            "unidade": c.get("unidade", "").strip(),
+                            "peso_lote_receita_kg": float(c.get("peso_unid_kg", 0.0)), # Adicionado para compatibilidade
+                            "unidade": c.get("unidade", "").strip()
                         }
                         for c in comps
                     ]
