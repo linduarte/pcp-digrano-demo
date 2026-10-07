@@ -16,7 +16,7 @@ Uma aplicação moderna, leve e de alta performance desenvolvida em **Python** p
 
 ## 📐 Estrutura do Banco / Modelo de Dados
 
-O projeto adota a separação entre a **Mática de Embalagem** e a **Ficha Técnica de Produção**:
+"O projeto adota a separação entre a ***Matemática de Embalagem*** (fatores de conversão: pacotes por caixa, unidades por pacote e tabuleiros) e a ***Ficha Técnica de Produção*** (ingredientes e insumos do produto)."
 
 📊 Modelo da Planilha de Origem (Modelo_Ref_PCP_NDJSON.xlsx)
 ├── Aba 'PRODUTOS' (Cadastro Comercial)
