@@ -1,4 +1,3 @@
-
 # 🏭 Sistema de PCP - Linha de Alimentos (DiGrano)
 
 Uma aplicação moderna, leve e de alta performance desenvolvida em **Python** para Planejamento e Controle da Produção (PCP). O sistema realiza a explosão instantânea de ordens de produção em insumos e semiacabados (massas, recheios e acabamentos) e calcula o loteamento exato de receitas para a cozinha.
@@ -52,6 +51,7 @@ Ao iniciar, o motor de dados aninha as fichas técnicas no formato **NDJSON** em
   ]
 }
 ```
+
 🛠️ Tecnologias Utilizadas
 Python 3.12+: Linguagem principal.
 
