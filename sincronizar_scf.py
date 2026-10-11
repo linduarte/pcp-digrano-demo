@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 
 import pyodbc  # type: ignore[import-not-found]
 from dotenv import load_dotenv
@@ -21,49 +22,72 @@ DB_CONFIG = {
 
 # 1. Consulta SQL simplificada e abrangente
 QUERY_SCF = """
+WITH CTE_ArvoreBOM AS (
+    SELECT 
+        RTRIM(e.codigoProduto) COLLATE DATABASE_DEFAULT AS codigo_pai_raiz,
+        RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT AS codigo_filho,
+        CAST(e.quantidadeInsumo AS FLOAT) AS qtd_acumulada,
+        e.unidadeMedidaInsumo AS unidade,
+        1 AS profundidade
+    FROM dbo.viewEstruturaProduto e
+
+    UNION ALL
+
+    SELECT 
+        a.codigo_pai_raiz,
+        RTRIM(e2.codigoInsumo) COLLATE DATABASE_DEFAULT AS codigo_filho,
+        CAST(a.qtd_acumulada * e2.quantidadeInsumo AS FLOAT) AS qtd_acumulada,
+        e2.unidadeMedidaInsumo AS unidade,
+        a.profundidade + 1
+    FROM CTE_ArvoreBOM a
+    INNER JOIN dbo.viewEstruturaProduto e2 
+        ON a.codigo_filho = RTRIM(e2.codigoProduto) COLLATE DATABASE_DEFAULT
+    WHERE a.profundidade < 6
+)
 SELECT 
     p.codigoInterno AS id_interno_scf,
     ISNULL(NULLIF(RTRIM(p.partNumber), ''), CAST(p.codigoInterno AS VARCHAR)) AS codigo_produto_real,
     p.nome AS descricao_caixa,
     ISNULL(l.nome, 'GERAL') AS linha,
-    ISNULL(p.padraoApontamento1, 1) AS pct_por_cx,
-    ISNULL(p.padraoApontamento2, 1) AS uni_por_pct,
+    ISNULL(NULLIF(p.padraoApontamento1, 0), 3) AS pct_por_cx,
+    ISNULL(NULLIF(p.padraoApontamento2, 0), 10) AS uni_por_pct,
     ISNULL(p.quantidadeBandeja, 0) AS qtd_por_tabuleiro,
     p.peso AS peso_unitario_kg,
     (
-        SELECT 
-            ISNULL(c.nome, 'GERAL') AS tipo,
-            RTRIM(e.codigoInsumo) AS codigo_insumo,
+        SELECT DISTINCT
+            ISNULL(MAX(c.nome), 'SEMIACABADOS') AS tipo,
+            RTRIM(a.codigo_filho) AS codigo_insumo,
             COALESCE(
-                NULLIF(RTRIM(i.nomeReduzido) COLLATE DATABASE_DEFAULT, ''),
-                NULLIF(RTRIM(i_ext.nomeReduzido) COLLATE DATABASE_DEFAULT, ''),
-                NULLIF(RTRIM(pg.nome) COLLATE DATABASE_DEFAULT, ''),
-                NULLIF(RTRIM(pg_int.nome) COLLATE DATABASE_DEFAULT, ''),
-                -- Caso seja embalagem / insumo genérico sem cadastro na tabela insumo
-                RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT
+                NULLIF(RTRIM(MAX(i.nomeReduzido)) COLLATE DATABASE_DEFAULT, ''),
+                NULLIF(RTRIM(MAX(pg.nome)) COLLATE DATABASE_DEFAULT, ''),
+                RTRIM(a.codigo_filho) COLLATE DATABASE_DEFAULT
             ) AS descricao_insumo,
-            e.quantidadeInsumo AS peso_unid_kg,
-            e.quantidadeInsumo AS peso_lote_receita_kg,
-            e.unidadeMedidaInsumo AS unidade
-        FROM dbo.viewEstruturaProduto e
-        LEFT JOIN dbo.insumo i 
-            ON TRY_CAST(RTRIM(LTRIM(e.codigoInsumo)) AS INT) = i.codigoInterno
-        LEFT JOIN dbo.insumo i_ext 
-            ON LTRIM(RTRIM(e.codigoInsumo)) COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(i_ext.codigoExterno)) COLLATE DATABASE_DEFAULT
+            MAX(a.qtd_acumulada) AS peso_unid_kg,
+            MAX(a.qtd_acumulada) AS peso_lote_receita_kg,
+            MAX(a.unidade) AS unidade
+        FROM CTE_ArvoreBOM a
         LEFT JOIN dbo.produtoGeral pg
-            ON LTRIM(RTRIM(e.codigoInsumo)) COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(pg.partNumber)) COLLATE DATABASE_DEFAULT
-        LEFT JOIN dbo.produtoGeral pg_int
-            ON TRY_CAST(LTRIM(RTRIM(e.codigoInsumo)) AS INT) = pg_int.codigoInterno
+            ON (RTRIM(a.codigo_filho) = CAST(pg.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT 
+                OR RTRIM(a.codigo_filho) = RTRIM(pg.partNumber) COLLATE DATABASE_DEFAULT)
+        LEFT JOIN dbo.insumo i 
+            ON (RTRIM(a.codigo_filho) = RTRIM(i.codigoExterno) COLLATE DATABASE_DEFAULT 
+                OR RTRIM(a.codigo_filho) = CAST(i.codigoInterno AS VARCHAR(50)) COLLATE DATABASE_DEFAULT)
         LEFT JOIN dbo.categoriaInsumo c 
-            ON i.categoriaInsumo = c.codigoInterno OR i_ext.categoriaInsumo = c.codigoInterno
+            ON i.categoriaInsumo = c.codigoInterno
         WHERE 
-            LTRIM(RTRIM(e.codigoProduto)) COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(p.partNumber)) COLLATE DATABASE_DEFAULT
-            OR LTRIM(RTRIM(e.codigoProduto)) COLLATE DATABASE_DEFAULT = CAST(p.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT
+            (RTRIM(a.codigo_pai_raiz) = RTRIM(p.partNumber) COLLATE DATABASE_DEFAULT
+             OR RTRIM(a.codigo_pai_raiz) = CAST(p.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT)
+            AND RTRIM(a.codigo_filho) LIKE '20%'
+            AND (
+                NULLIF(RTRIM(pg.nome) COLLATE DATABASE_DEFAULT, '') IS NOT NULL 
+                OR NULLIF(RTRIM(i.nomeReduzido) COLLATE DATABASE_DEFAULT, '') IS NOT NULL
+            )
+        GROUP BY RTRIM(a.codigo_filho)
         FOR JSON PATH
     ) AS composicoes_json
 FROM dbo.produtoGeral p
-LEFT JOIN dbo.linha l 
-    ON p.linha = l.codigoInterno;
+LEFT JOIN dbo.linha l ON p.linha = l.codigoInterno
+WHERE RTRIM(p.partNumber) LIKE '10%' OR RTRIM(p.partNumber) LIKE 'SCF%';
 """
 
 
@@ -81,12 +105,7 @@ def executar_sincronizacao():
     cursor.execute(QUERY_SCF)
     rows = cursor.fetchall()
 
-    # Dicionário De-Para para insumos/embalagens que não possuem descrição no SQL
-    depara_embalagens = {
-        "551035": "SACO PLÁSTICO / EMBALAGEM PRIMÁRIA 180G",
-        "552016": "FITA ADESIVA TRANSPARENTE 45MM",
-        "552028": "ETIQUETA TÉRMICA PADRÃO FALEIRO 100X50",
-    }
+
 
     produtos = []
     for row in rows:
@@ -104,13 +123,15 @@ def executar_sincronizacao():
         if json_comps:
             try:
                 clean_comps = json.loads(json_comps)
-                # Aplica a substituição para descrições não resolvidas no SQL
                 for comp in clean_comps:
-                    cod_insumo = str(comp.get("codigo_insumo", "")).strip()
                     desc_insumo = str(comp.get("descricao_insumo", "")).strip()
-
-                    if (desc_insumo == cod_insumo or not desc_insumo) and cod_insumo in depara_embalagens:
-                        comp["descricao_insumo"] = depara_embalagens[cod_insumo]
+                    match = re.search(r"-\s*([\d,.]+)\s*(?:KG)?\s*-", desc_insumo)
+                    if match:
+                        try:
+                            peso_lote = float(match.group(1).replace(",", "."))
+                            comp["peso_lote_receita_kg"] = peso_lote
+                        except ValueError:
+                            pass
             except json.JSONDecodeError:
                 clean_comps = []
 
