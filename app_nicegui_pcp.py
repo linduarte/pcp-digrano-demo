@@ -1,4 +1,9 @@
-"""Aplicação NiceGUI para Planejamento e Controle de Produção (PCP) utilizando DuckDB e NiceGUI."""
+"""
+app_nicegui_pcp.py
+Aplicação de Interface do PCP em NiceGUI integrada ao DuckDB e NDJSON.
+Trata formatação PT-BR para exibição e mapeamento do Part Number (Código Real de Produto).
+"""
+
 import datetime
 import json
 import math
@@ -12,6 +17,51 @@ from nicegui import ui
 
 # Garante que o diretório do script está no caminho de importação
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Importação com contingência do módulo de formatação PT-BR
+try:
+    from utils_formatacao import (  # pyrefly: ignore [missing-import]
+        converter_para_float as _converter_para_float_impl,
+    )  # type: ignore[import-not-found]
+    from utils_formatacao import (  # pyrefly: ignore [missing-import]
+        formatar_para_scf as _formatar_para_scf_impl,
+    )  # type: ignore[import-not-found]
+except ImportError:
+
+    def _formatar_para_scf_fallback(valor: Any, casas_decimais: int = 3) -> str:
+        if valor is None:
+            return "0,000"
+        try:
+            val_f = float(valor)
+            txt = f"{val_f:,.{casas_decimais}f}"
+            return txt.replace(",", "X").replace(".", ",").replace("X", ".")
+        except (ValueError, TypeError):
+            return str(valor)
+
+    def _converter_para_float_fallback(valor_raw: Any) -> float:
+        if not valor_raw:
+            return 0.0
+        if isinstance(valor_raw, (int, float)):
+            return float(valor_raw)
+        try:
+            texto = str(valor_raw).strip().replace(".", "").replace(",", ".")
+            return float(texto)
+        except ValueError:
+            return 0.0
+
+    _formatar_para_scf_impl = _formatar_para_scf_fallback
+    _converter_para_float_impl = _converter_para_float_fallback
+
+
+def formatar_para_scf(valor: Any, casas_decimais: int = 3) -> str:
+    """Formata um valor para o padrão numérico utilizado pelo SCF."""
+    return _formatar_para_scf_impl(valor, casas_decimais)
+
+
+def converter_para_float(valor: Any) -> float:
+    """Converte um valor para float usando a implementação configurada."""
+    return _converter_para_float_impl(valor)
+
 
 # Tenta importar o módulo de sincronização do SCF
 executar_sincronizacao: Optional[Callable[[], Any]]
@@ -62,7 +112,8 @@ def carregar_dados_duckdb():
                     'descricao_insumo': f.Descricao_Insumo,
                     'peso_unid_kg': f.Peso_Unid_KG,
                     'peso_lote_receita_kg': f.Peso_Lote_Receita_KG,
-                    'permite_meio_lote': f.Permite_Meio_Lote
+                    'permite_meio_lote': f.Permite_Meio_Lote,
+                    'unidade': 'KG'
                 }) AS composicoes
             FROM df_produtos p
             JOIN df_fichas f ON p.Codigo_Caixa = f.Codigo_Produto
@@ -82,16 +133,20 @@ estado_dados = dict(zip(("con_duck", "fonte_atual"), carregar_dados_duckdb()))
 
 
 def consultar_produtos():
-    """Return the product records ordered by box code."""
-    return estado_dados["con_duck"].execute("""
+    """Retorna os registros de produtos ordenados pelo Part Number / Código."""
+    return (
+        estado_dados["con_duck"]
+        .execute("""
         SELECT CAST(codigo_caixa AS VARCHAR) AS codigo_caixa, descricao_caixa, linha, pct_por_cx, uni_por_pct 
         FROM fichas_tecnicas 
         ORDER BY codigo_caixa
-    """).df()
+    """)
+        .df()
+    )
 
 
 def calcular_ordem_duckdb(itens_op):
-    """Return the ingredient breakdown for each production item."""
+    """Retorna o detalhamento de insumos com suporte a Part Number e formato PT-BR."""
     if not itens_op:
         return []
 
@@ -107,7 +162,8 @@ def calcular_ordem_duckdb(itens_op):
                 CAST(comp.codigo_insumo AS VARCHAR) AS cod_insumo,
                 comp.descricao_insumo AS desc_insumo,
                 COALESCE(comp.peso_unid_kg, 0) AS peso_unid_kg,
-                COALESCE(comp.peso_lote_receita_kg, 1.0) AS peso_lote_receita_kg
+                COALESCE(comp.peso_lote_receita_kg, 1.0) AS peso_lote_receita_kg,
+                COALESCE(comp.unidade, 'KG') AS unidade
             FROM fichas_tecnicas,
             UNNEST(composicoes) AS t(comp)
             WHERE CAST(codigo_caixa AS VARCHAR) = ?
@@ -117,14 +173,23 @@ def calcular_ordem_duckdb(itens_op):
     resultados = []
     for item in itens_op:
         codigo_caixa = str(item["codigo_caixa"])
-        caixas = float(item.get("caixas") or 0)
-        pacotes = float(item.get("pacotes") or 0)
-        unidades = float(item.get("unidades") or 0)
+        caixas = converter_para_float(item.get("caixas"))
+        pacotes = converter_para_float(item.get("pacotes"))
+        unidades = converter_para_float(item.get("unidades"))
 
         if caixas == 0 and pacotes == 0 and unidades == 0:
             continue
 
         df_comp = _consultar_composicoes(codigo_caixa)
+        if df_comp.empty:
+            continue
+
+        # FILTRO DE RECEITAS PCP:
+        # Remove itens de embalagem/suporte (faixa 55XXXX) mantendo estritamente
+        # os componentes operacionais de receita/cozinha (ex: 102135, massas e recheios)
+        df_comp = df_comp[
+            ~df_comp["cod_insumo"].astype(str).str.strip().str.startswith("55")
+        ]
         if df_comp.empty:
             continue
 
@@ -139,19 +204,23 @@ def calcular_ordem_duckdb(itens_op):
             if lote_kg <= 0:
                 lote_kg = 1.0
             num_lotes = math.ceil((kg_liq / lote_kg) * 2) / 2
+            total_bruto = num_lotes * lote_kg
 
             resultados.append(
                 {
                     "codigo_caixa": str(row["codigo_caixa"]),
                     "descricao_caixa": row["descricao_caixa"],
-                    "total_unidades": f"{total_unidades:,.0f}",
+                    "linha": str(row.get("linha", "GERAL")),
+                    "total_unidades": formatar_para_scf(
+                        total_unidades, casas_decimais=0
+                    ),
                     "cod_insumo": str(row["cod_insumo"]),
                     "desc_insumo": row["desc_insumo"],
-                    "tipo_comp": row["tipo_comp"],
-                    "kg_liquido": f"{kg_liq:.3f} KG",
-                    "lote_kg": f"{lote_kg:.2f} KG",
-                    "num_lotes": f"{num_lotes:.1f}",
-                    "kg_bruto": f"{num_lotes * lote_kg:.3f} KG",
+                    "unidade": str(row.get("unidade", "KG")),
+                    "lote_kg_str": formatar_para_scf(lote_kg, casas_decimais=3),
+                    "total_bruto_str": formatar_para_scf(total_bruto, casas_decimais=3),
+                    "kg_liquido": formatar_para_scf(kg_liq, casas_decimais=3),
+                    "num_lotes": formatar_para_scf(num_lotes, casas_decimais=1),
                 }
             )
 
@@ -186,7 +255,7 @@ def carregar_historico_ops():
                             "raw_json": data,
                         }
                     )
-            except OSError, json.JSONDecodeError:
+            except (OSError, json.JSONDecodeError):
                 pass
     return historico
 
@@ -197,17 +266,18 @@ def carregar_historico_ops():
 @ui.page("/")
 # pylint: disable=too-many-locals,too-many-statements
 def main_page():
-    """Render the production-order interface and its history."""
+    """Renderiza a interface do PCP e seu histórico."""
 
     ui.colors(primary="#1E40AF", secondary="#0D9488", accent="#F59E0B", dark="#0F172A")
 
+    # BARRA DE CABEÇALHO SUPERIOR (REBRANDING FALEIRO)
     with ui.header().classes(
         "bg-primary text-white p-4 items-center justify-between shadow-lg"
     ):
         with ui.row().classes("items-center gap-3"):
             ui.icon("factory", size="32px")
             with ui.column().classes("gap-0"):
-                ui.label("PCP - Linha de Alimentos DiGrano").classes(
+                ui.label("PCP - Linha de Alimentos Faleiro").classes(
                     "text-xl font-bold tracking-wide"
                 )
                 ui.label(
@@ -217,9 +287,7 @@ def main_page():
         with ui.row().classes("items-center gap-3"):
             badge_fonte = ui.badge(
                 f"Fonte: {estado_dados['fonte_atual']}", color="teal"
-            ).classes(
-                "text-xs px-3 py-1 font-mono"
-            )
+            ).classes("text-xs px-3 py-1 font-mono")
 
             def acao_sincronizar_scf():
                 if executar_sincronizacao is None:
@@ -236,7 +304,7 @@ def main_page():
                     )
                     badge_fonte.text = f"Fonte: {estado_dados['fonte_atual']}"
 
-                    # Atualiza opções do dropdown de produtos
+                    # Atualiza opções do dropdown de produtos usando o Part Number
                     prods = consultar_produtos()
                     select_prod.options = {
                         str(
@@ -267,18 +335,18 @@ def main_page():
     ordem_itens = []
 
     with ui.tabs().classes("w-full bg-slate-100 text-slate-700 font-bold") as tabs:
-        tab_lançamento = ui.tab(
+        tab_lancamento = ui.tab(
             "Gerador de OP / Explosão Insumos", icon="add_shopping_cart"
         )
         tab_historico = ui.tab(
             "Histórico de OPs Enviadas ao SCF", icon="format_list_bulleted"
         )
 
-    with ui.tab_panels(tabs, value=tab_lançamento).classes("w-full bg-slate-50 p-6"):
+    with ui.tab_panels(tabs, value=tab_lancamento).classes("w-full bg-slate-50 p-6"):
         # ---------------------------------------------------------------------
         # ABA 1: GERADOR DE OP
         # ---------------------------------------------------------------------
-        with ui.tab_panel(tab_lançamento).classes("gap-6"):
+        with ui.tab_panel(tab_lancamento).classes("gap-6"):
             # Card 1: Inserção de Ordens
             with ui.card().classes(
                 "w-full p-5 border border-slate-200 shadow-sm rounded-xl bg-white mb-6"
@@ -290,8 +358,9 @@ def main_page():
                 with ui.row().classes("w-full items-center gap-4 flex-wrap"):
                     select_prod = ui.select(
                         options=dict_produtos,
-                        label="Selecione o Produto Final",
+                        label="Selecione o Produto Final (Part Number)",
                         value=list(dict_produtos.keys())[0] if dict_produtos else None,
+                        with_input=True,  # Habilita a digitação e filtro dinâmico
                     ).classes("w-96")
 
                     input_cx = ui.number(
@@ -306,9 +375,9 @@ def main_page():
 
                     def adicionar_item_op():
                         cod = select_prod.value
-                        cx = input_cx.value or 0
-                        pct = input_pct.value or 0
-                        und = input_und.value or 0
+                        cx = converter_para_float(input_cx.value)
+                        pct = converter_para_float(input_pct.value)
+                        und = converter_para_float(input_und.value)
 
                         if cx == 0 and pct == 0 and und == 0:
                             ui.notify(
@@ -334,7 +403,7 @@ def main_page():
                         "Adicionar Lote", icon="add_circle", on_click=adicionar_item_op
                     ).classes("bg-secondary text-white shadow-md")
 
-            # Card 2: Tabela de Resultados
+            # Card 2: Tabela de Resultados Ajustada conforme Diretrizes PCP
             with ui.card().classes(
                 "w-full p-5 border border-slate-200 shadow-sm rounded-xl bg-white"
             ):
@@ -367,7 +436,7 @@ def main_page():
                             payload_op = {
                                 "op_id": op_id,
                                 "data_hora": now_str,
-                                "linha_producao": "Linha DiGrano",
+                                "linha_producao": "Linha Faleiro",
                                 "programacao_produtos": ordem_itens,
                                 "explosao_insumos": insumos_calc,
                             }
@@ -397,63 +466,39 @@ def main_page():
 
                 colunas_tabela = [
                     {
-                        "name": "codigo_caixa",
-                        "label": "Cód. Prod.",
-                        "field": "codigo_caixa",
-                        "align": "left",
-                    },
-                    {
-                        "name": "descricao_caixa",
-                        "label": "Produto Final",
-                        "field": "descricao_caixa",
-                        "align": "left",
-                    },
-                    {
-                        "name": "total_unidades",
-                        "label": "Total Unid.",
-                        "field": "total_unidades",
-                        "align": "center",
-                    },
-                    {
-                        "name": "tipo_comp",
-                        "label": "Tipo",
-                        "field": "tipo_comp",
-                        "align": "center",
-                    },
-                    {
                         "name": "cod_insumo",
-                        "label": "Cód. Insumo",
+                        "label": "Código",
                         "field": "cod_insumo",
                         "align": "left",
                     },
                     {
                         "name": "desc_insumo",
-                        "label": "Componente / Receita Semiacabado",
+                        "label": "Descrição do Insumo",
                         "field": "desc_insumo",
                         "align": "left",
                     },
                     {
-                        "name": "kg_liquido",
-                        "label": "Nec. Líquida (KG)",
-                        "field": "kg_liquido",
-                        "align": "right",
+                        "name": "linha",
+                        "label": "Linha",
+                        "field": "linha",
+                        "align": "left",
                     },
                     {
-                        "name": "lote_kg",
+                        "name": "lote_kg_str",
                         "label": "Lote Padrão",
-                        "field": "lote_kg",
+                        "field": "lote_kg_str",
                         "align": "right",
                     },
                     {
-                        "name": "num_lotes",
-                        "label": "Nº Receitas (0.5)",
-                        "field": "num_lotes",
+                        "name": "unidade",
+                        "label": "Unidade",
+                        "field": "unidade",
                         "align": "center",
                     },
                     {
-                        "name": "kg_bruto",
-                        "label": "Total Bruto a Preparar",
-                        "field": "kg_bruto",
+                        "name": "total_bruto_str",
+                        "label": "Total bruto a preparar",
+                        "field": "total_bruto_str",
                         "align": "right",
                     },
                 ]
@@ -538,4 +583,4 @@ def main_page():
                 atualizar_historico_ui()
 
 
-ui.run(title="PCP DiGrano - NiceGUI & DuckDB", port=8085, reload=False)
+ui.run(title="PCP Faleiro - NiceGUI & DuckDB", port=8085, reload=False)
