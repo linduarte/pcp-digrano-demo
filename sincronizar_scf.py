@@ -3,7 +3,7 @@
 import json
 import os
 
-import pyodbc  # type: ignore
+import pyodbc  # type: ignore[import-not-found]
 from dotenv import load_dotenv
 
 # Carrega as variáveis de ambiente do ficheiro .env
@@ -18,11 +18,14 @@ DB_CONFIG = {
     "password": os.getenv("SCF_DB_PASS", ""),
 }
 
-query_scf = """
+
+# 1. Consulta SQL simplificada e abrangente
+QUERY_SCF = """
 SELECT 
-    p.codigoInterno AS codigo_caixa,
+    p.codigoInterno AS id_interno_scf,
+    ISNULL(NULLIF(RTRIM(p.partNumber), ''), CAST(p.codigoInterno AS VARCHAR)) AS codigo_produto_real,
     p.nome AS descricao_caixa,
-    l.nome AS linha,
+    ISNULL(l.nome, 'GERAL') AS linha,
     ISNULL(p.padraoApontamento1, 1) AS pct_por_cx,
     ISNULL(p.padraoApontamento2, 1) AS uni_por_pct,
     ISNULL(p.quantidadeBandeja, 0) AS qtd_por_tabuleiro,
@@ -31,51 +34,31 @@ SELECT
         SELECT 
             ISNULL(c.nome, 'GERAL') AS tipo,
             RTRIM(e.codigoInsumo) AS codigo_insumo,
-            ISNULL(i.nomeReduzido, RTRIM(e.codigoInsumo)) AS descricao_insumo,
+            COALESCE(
+                NULLIF(RTRIM(i.nomeReduzido) COLLATE DATABASE_DEFAULT, ''),
+                NULLIF(RTRIM(i_ext.nomeReduzido) COLLATE DATABASE_DEFAULT, ''),
+                NULLIF(RTRIM(pg.nome) COLLATE DATABASE_DEFAULT, ''),
+                NULLIF(RTRIM(pg_int.nome) COLLATE DATABASE_DEFAULT, ''),
+                -- Caso seja embalagem / insumo genérico sem cadastro na tabela insumo
+                RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT
+            ) AS descricao_insumo,
             e.quantidadeInsumo AS peso_unid_kg,
+            e.quantidadeInsumo AS peso_lote_receita_kg,
             e.unidadeMedidaInsumo AS unidade
         FROM dbo.viewEstruturaProduto e
         LEFT JOIN dbo.insumo i 
-            ON (RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT = CAST(i.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT 
-                OR RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT = RTRIM(i.codigoExterno) COLLATE DATABASE_DEFAULT)
+            ON TRY_CAST(RTRIM(LTRIM(e.codigoInsumo)) AS INT) = i.codigoInterno
+        LEFT JOIN dbo.insumo i_ext 
+            ON LTRIM(RTRIM(e.codigoInsumo)) COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(i_ext.codigoExterno)) COLLATE DATABASE_DEFAULT
+        LEFT JOIN dbo.produtoGeral pg
+            ON LTRIM(RTRIM(e.codigoInsumo)) COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(pg.partNumber)) COLLATE DATABASE_DEFAULT
+        LEFT JOIN dbo.produtoGeral pg_int
+            ON TRY_CAST(LTRIM(RTRIM(e.codigoInsumo)) AS INT) = pg_int.codigoInterno
         LEFT JOIN dbo.categoriaInsumo c 
-            ON i.categoriaInsumo = c.codigoInterno
+            ON i.categoriaInsumo = c.codigoInterno OR i_ext.categoriaInsumo = c.codigoInterno
         WHERE 
-            RTRIM(e.codigoProduto) COLLATE DATABASE_DEFAULT = RTRIM(p.partNumber) COLLATE DATABASE_DEFAULT
-            OR RTRIM(e.codigoProduto) COLLATE DATABASE_DEFAULT = CAST(p.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT
-        FOR JSON PATH
-    ) AS composicoes_json
-FROM dbo.produtoGeral p
-LEFT JOIN dbo.linha l 
-    ON p.linha = l.codigoInterno;
-"""
-
-
-query_scf = """
-SELECT 
-    p.codigoInterno AS codigo_caixa,
-    p.nome AS descricao_caixa,
-    l.nome AS linha,
-    ISNULL(p.padraoApontamento1, 1) AS pct_por_cx,
-    ISNULL(p.padraoApontamento2, 1) AS uni_por_pct,
-    ISNULL(p.quantidadeBandeja, 0) AS qtd_por_tabuleiro,
-    p.peso AS peso_unitario_kg,
-    (
-        SELECT 
-            ISNULL(c.nome, 'GERAL') AS tipo,
-            RTRIM(e.codigoInsumo) AS codigo_insumo,
-            ISNULL(i.nomeReduzido, RTRIM(e.codigoInsumo)) AS descricao_insumo,
-            e.quantidadeInsumo AS peso_unid_kg,
-            e.unidadeMedidaInsumo AS unidade
-        FROM dbo.viewEstruturaProduto e
-        LEFT JOIN dbo.insumo i 
-            ON (RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT = CAST(i.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT 
-                OR RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT = RTRIM(i.codigoExterno) COLLATE DATABASE_DEFAULT)
-        LEFT JOIN dbo.categoriaInsumo c 
-            ON i.categoriaInsumo = c.codigoInterno
-        WHERE 
-            RTRIM(e.codigoProduto) COLLATE DATABASE_DEFAULT = RTRIM(p.partNumber) COLLATE DATABASE_DEFAULT
-            OR RTRIM(e.codigoProduto) COLLATE DATABASE_DEFAULT = CAST(p.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT
+            LTRIM(RTRIM(e.codigoProduto)) COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(p.partNumber)) COLLATE DATABASE_DEFAULT
+            OR LTRIM(RTRIM(e.codigoProduto)) COLLATE DATABASE_DEFAULT = CAST(p.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT
         FOR JSON PATH
     ) AS composicoes_json
 FROM dbo.produtoGeral p
@@ -86,61 +69,72 @@ LEFT JOIN dbo.linha l
 
 def executar_sincronizacao():
     """Sincroniza os produtos do SCF para um ficheiro NDJSON."""
-    driver_str = "{" + DB_CONFIG["driver"].strip("{}") + "}"
-    conn_str = (
-        f"DRIVER={driver_str};"
+    connection_string = (
+        f"DRIVER={{{DB_CONFIG['driver']}}};"
         f"SERVER={DB_CONFIG['server']};"
         f"DATABASE={DB_CONFIG['database']};"
         f"UID={DB_CONFIG['user']};"
-        f"PWD={DB_CONFIG['password']};"
+        f"PWD={DB_CONFIG['password']}"
     )
+    connection = pyodbc.connect(connection_string)  # pylint: disable=c-extension-no-member
+    cursor = connection.cursor()
+    cursor.execute(QUERY_SCF)
+    rows = cursor.fetchall()
 
-    print(f"Conectando ao SQL Server em {DB_CONFIG['server']}...")
-    connect = getattr(pyodbc, "connect")
-    with connect(conn_str) as conn:
-        cursor = conn.cursor()
-        cursor.execute(query_scf)
-        rows = cursor.fetchall()
+    # Dicionário De-Para para insumos/embalagens que não possuem descrição no SQL
+    depara_embalagens = {
+        "551035": "SACO PLÁSTICO / EMBALAGEM PRIMÁRIA 180G",
+        "552016": "FITA ADESIVA TRANSPARENTE 45MM",
+        "552028": "ETIQUETA TÉRMICA PADRÃO FALEIRO 100X50",
+    }
 
-        arquivo_saida = "fichas_tecnicas_scf.ndjson"
-        total_processado = 0
+    produtos = []
+    for row in rows:
+        # Acesso seguro por índice para evitar erros de atributo do pyodbc
+        id_interno = str(row[0]) if row[0] is not None else ""
+        part_num = str(row[1]).strip() if row[1] is not None else id_interno
+        desc_caixa = str(row[2]).strip() if row[2] is not None else ""
+        nome_linha = str(row[3]).strip() if row[3] is not None else "GERAL"
+        pct_cx = int(row[4]) if row[4] is not None else 1
+        uni_pct = int(row[5]) if row[5] is not None else 1
+        qtd_tab = int(row[6]) if row[6] is not None else 0
+        json_comps = row[8] if len(row) > 8 else None
 
-        with open(arquivo_saida, "w", encoding="utf-8") as f:
-            for row in rows:
-                if not row.composicoes_json:
-                    continue
+        clean_comps = []
+        if json_comps:
+            try:
+                clean_comps = json.loads(json_comps)
+                # Aplica a substituição para descrições não resolvidas no SQL
+                for comp in clean_comps:
+                    cod_insumo = str(comp.get("codigo_insumo", "")).strip()
+                    desc_insumo = str(comp.get("descricao_insumo", "")).strip()
 
-                try:
-                    comps = json.loads(row.composicoes_json)
-                    clean_comps = [
-                        {
-                            "tipo": c.get("tipo", "").strip(),
-                            "codigo_insumo": c.get("codigo_insumo", "").strip(),
-                            "descricao_insumo": c.get("descricao_insumo", "").strip(),
-                            "peso_unid_kg": float(c.get("peso_unid_kg", 0.0)),
-                            "peso_lote_receita_kg": float(c.get("peso_unid_kg", 0.0)), # Adicionado para compatibilidade
-                            "unidade": c.get("unidade", "").strip()
-                        }
-                        for c in comps
-                    ]
+                    if (desc_insumo == cod_insumo or not desc_insumo) and cod_insumo in depara_embalagens:
+                        comp["descricao_insumo"] = depara_embalagens[cod_insumo]
+            except json.JSONDecodeError:
+                clean_comps = []
 
-                    item = {
-                        "codigo_caixa": str(row.codigo_caixa),
-                        "descricao_caixa": str(row.descricao_caixa).strip(),
-                        "linha": str(row.linha).strip() if row.linha else "GERAL",
-                        "pct_por_cx": int(row.pct_por_cx),
-                        "uni_por_pct": int(row.uni_por_pct),
-                        "qtd_por_tabuleiro": int(row.qtd_por_tabuleiro),
-                        "composicoes": clean_comps,
-                    }
-                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                    total_processado += 1
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    print(f"Erro ao processar item {row.codigo_caixa}: {exc}")
-
-        print(
-            f"Sucesso! {total_processado} produtos sincronizados em '{arquivo_saida}'."
+        produtos.append(
+            {
+                "codigo_caixa": part_num,
+                "codigo_interno_scf": id_interno,
+                "descricao_caixa": desc_caixa,
+                "linha": nome_linha,
+                "pct_por_cx": pct_cx,
+                "uni_por_pct": uni_pct,
+                "qtd_por_tabuleiro": qtd_tab,
+                "composicoes": clean_comps,
+            }
         )
+
+    # Gravação do NDJSON
+    with open("fichas_tecnicas_scf.ndjson", "w", encoding="utf-8") as f:
+        for p in produtos:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+    print(
+        f"Sucesso! {len(produtos)} produtos sincronizados em 'fichas_tecnicas_scf.ndjson'."
+    )
 
 
 if __name__ == "__main__":
