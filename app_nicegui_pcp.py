@@ -1,32 +1,29 @@
 """
 app_nicegui_pcp.py
 Aplicação de Interface do PCP em NiceGUI integrada ao DuckDB e NDJSON.
-Trata formatação PT-BR para exibição e mapeamento do Part Number (Código Real de Produto).
+Trata formatação PT-BR para exibição, agrupamento único de insumos,
+arredondamento 0.5 e exibe a memória de cálculo das unidades físicas de produção.
 """
 
 import datetime
 import json
 import math
 import os
+import re
 import sys
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import duckdb
 import pandas as pd
 from nicegui import ui
 
-# Garante que o diretório do script está no caminho de importação
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Importação com contingência do módulo de formatação PT-BR
 try:
-    from utils_formatacao import (  # pyrefly: ignore [missing-import]
-        converter_para_float as _converter_para_float_impl,
-    )  # type: ignore[import-not-found]
-    from utils_formatacao import (  # pyrefly: ignore [missing-import]
-        formatar_para_scf as _formatar_para_scf_impl,
-    )  # type: ignore[import-not-found]
-except ImportError:
+    _utils_formatacao = __import__("utils_formatacao")
+    _converter_para_float_impl = _utils_formatacao.converter_para_float
+    _formatar_para_scf_impl = _utils_formatacao.formatar_para_scf
+except (ImportError, AttributeError):
 
     def _formatar_para_scf_fallback(valor: Any, casas_decimais: int = 3) -> str:
         if valor is None:
@@ -54,42 +51,132 @@ except ImportError:
 
 
 def formatar_para_scf(valor: Any, casas_decimais: int = 3) -> str:
-    """Formata um valor para o padrão numérico utilizado pelo SCF."""
+    """Formata um valor para o padrão de moeda SCF."""
     return _formatar_para_scf_impl(valor, casas_decimais)
 
 
 def converter_para_float(valor: Any) -> float:
-    """Converte um valor para float usando a implementação configurada."""
+    """Converte valores em texto, numéricos ou de moeda para float."""
     return _converter_para_float_impl(valor)
 
 
-# Tenta importar o módulo de sincronização do SCF
-executar_sincronizacao: Optional[Callable[[], Any]]
-try:
-    from sincronizar_scf import executar_sincronizacao  # type: ignore[import-not-found]
-except ImportError:
-    executar_sincronizacao = None
+executar_sincronizacao: Optional[Callable[[], Any]] = None
+
+for _nome_modulo_scf in ("sincronizar_scf", "src.sincronizar_scf"):
+    try:
+        _modulo_scf = __import__(_nome_modulo_scf, fromlist=["executar_sincronizacao"])
+        executar_sincronizacao = getattr(_modulo_scf, "executar_sincronizacao", None)
+        if executar_sincronizacao is not None:
+            break
+    except ImportError:
+        continue
+
+if executar_sincronizacao is None:
+    try:
+        from sincronizar_scf import executar_sincronizacao  # type: ignore[import-not-found]
+    except ImportError:
+        executar_sincronizacao = None
 
 
 # -----------------------------------------------------------------------------
-# 1. CARREGADOR DE DADOS EM MEMÓRIA DUCKDB (NDJSON DO SCF / EXCEL FALLBACK)
+# FUNÇÕES AUXILIARES DE EMBALAGEM E MEMÓRIA DE CÁLCULO
+# -----------------------------------------------------------------------------
+def gerar_memoria_calculo_unidades(cx: float, pct: float, und: float, pct_por_cx: float, uni_por_pct: float) -> str:
+    """
+    Gera o texto explicativo do cálculo de unidades.
+    Exemplo: (50 CX × 3 PCT × 10 UN) + (50 PCT × 10 UN) = 1.500 + 500 = 2.000 Unidades
+    """
+    qtd_cx_und = cx * pct_por_cx * uni_por_pct
+    qtd_pct_und = pct * uni_por_pct
+    total_unidades = qtd_cx_und + qtd_pct_und + und
+
+    partes = []
+    partes_soma = []
+
+    if cx > 0:
+        partes.append(f"({int(cx)} CX × {int(pct_por_cx)} PCT × {int(uni_por_pct)} UN)")
+        partes_soma.append(f"{int(qtd_cx_und):,}".replace(",", "."))
+
+    if pct > 0:
+        partes.append(f"({int(pct)} PCT × {int(uni_por_pct)} UN)")
+        partes_soma.append(f"{int(qtd_pct_und):,}".replace(",", "."))
+
+    if und > 0:
+        partes.append(f"{int(und)} UN")
+        partes_soma.append(f"{int(und):,}".replace(",", "."))
+
+    if not partes:
+        return "0 Unidades"
+
+    formula_str = " + ".join(partes)
+    soma_str = " + ".join(partes_soma)
+
+    if len(partes) > 1:
+        return f"{formula_str} = {soma_str} = {int(total_unidades):,} Unidades".replace(",", ".")
+    else:
+        return f"{formula_str} = {int(total_unidades):,} Unidades".replace(",", ".")
+
+
+def obter_fatores_embalagem(codigo_caixa: str, descricao_caixa: str) -> Tuple[float, float]:
+    """
+    Retorna os fatores de embalagem (pct_por_cx, uni_por_pct) reais do produto.
+    Lê a ficha técnica no DuckDB e aplica fallbacks dinâmicos de descrição comercial.
+    """
+    pct_cx = 3.0
+    uni_pct = 10.0
+
+    try:
+        df_p = estado_dados["con_duck"].execute(
+            "SELECT pct_por_cx, uni_por_pct FROM fichas_tecnicas WHERE CAST(codigo_caixa AS VARCHAR) = ?",
+            [str(codigo_caixa)],
+        ).df()
+
+        if not df_p.empty:
+            raw_pct = float(df_p["pct_por_cx"].iloc[0] or 0)
+            raw_uni = float(df_p["uni_por_pct"].iloc[0] or 0)
+
+            # Só utiliza valores do banco se não forem o padrão genérico/legado (1 e 2)
+            if (raw_pct > 1 or raw_uni > 2) and (raw_pct * raw_uni > 2):
+                pct_cx = raw_pct
+                uni_pct = raw_uni
+    except (duckdb.Error, AttributeError, ValueError, KeyError):
+        pass
+
+    # Leitura dinâmica da descrição comercial (Ex: "CX C/30" -> 3 PCT x 10 UN)
+    desc_upper = str(descricao_caixa).upper()
+    match_cx = re.search(r"CX\s*C/\s*(\d+)", desc_upper) or re.search(r"CX\s*(\d+)", desc_upper)
+    if match_cx:
+        try:
+            total_cx_unid = int(match_cx.group(1))
+            if total_cx_unid == 30:
+                pct_cx, uni_pct = 3.0, 10.0
+            elif total_cx_unid == 40:
+                pct_cx, uni_pct = 4.0, 10.0
+            elif total_cx_unid == 20:
+                pct_cx, uni_pct = 2.0, 10.0
+        except ValueError:
+            pass
+
+    return pct_cx, uni_pct
+
+
+# -----------------------------------------------------------------------------
+# CARREGADOR DE DADOS DUCKDB
 # -----------------------------------------------------------------------------
 def carregar_dados_duckdb():
-    """Lê o ficheiro NDJSON sincronizado do SCF ou usa o Excel como fallback."""
+    """Carrega os dados de fichas técnicas em memória usando DuckDB."""
     con = duckdb.connect(":memory:")
     ndjson_file = "fichas_tecnicas_scf.ndjson"
     excel_file = "Modelo_Ref_PCP_NDJSON.xlsx"
     if not os.path.exists(excel_file):
         excel_file = "Modelo_Modelo_Ref_PCP_NDJSON.xlsx"
 
-    # Opção A: Ficheiro NDJSON nativo do SCF existe
     if os.path.exists(ndjson_file) and os.path.getsize(ndjson_file) > 0:
         con.execute(f"""
             CREATE TABLE fichas_tecnicas AS 
             SELECT * FROM read_ndjson_auto('{ndjson_file}')
         """)
         source_mode = "SCF NDJSON (SQL Server)"
-    # Opção B: Fallback para a planilha Excel
     elif os.path.exists(excel_file):
         df_produtos = pd.read_excel(excel_file, sheet_name="PRODUTOS")
         df_fichas = pd.read_excel(excel_file, sheet_name="FICHA_TECNICA")
@@ -121,19 +208,16 @@ def carregar_dados_duckdb():
         """)
         source_mode = "Excel Fallback"
     else:
-        raise FileNotFoundError(
-            "Nenhuma fonte de dados (NDJSON ou Excel) foi encontrada!"
-        )
+        raise FileNotFoundError("Nenhuma fonte de dados encontrada!")
 
     return con, source_mode
 
 
-# Inicialização global do DuckDB
 estado_dados = dict(zip(("con_duck", "fonte_atual"), carregar_dados_duckdb()))
 
 
 def consultar_produtos():
-    """Retorna os registros de produtos ordenados pelo Part Number / Código."""
+    """Retorna a lista de produtos cadastrados em ordem de código."""
     return (
         estado_dados["con_duck"]
         .execute("""
@@ -146,11 +230,11 @@ def consultar_produtos():
 
 
 def calcular_ordem_duckdb(itens_op):
-    """Retorna o detalhamento de insumos com suporte a Part Number e formato PT-BR."""
+    """Calcula a necessidade de insumos para uma ordem de produção."""
     if not itens_op:
         return []
 
-    def _consultar_composicoes(codigo_caixa):
+    def _consultar_composicoes(codigo_caixa: str):
         query = """
             SELECT
                 CAST(codigo_caixa AS VARCHAR) AS codigo_caixa,
@@ -168,74 +252,120 @@ def calcular_ordem_duckdb(itens_op):
             UNNEST(composicoes) AS t(comp)
             WHERE CAST(codigo_caixa AS VARCHAR) = ?
         """
-        return estado_dados["con_duck"].execute(query, [codigo_caixa]).df()
+        try:
+            return estado_dados["con_duck"].execute(query, [codigo_caixa]).df()
+        except (AttributeError, TypeError, ValueError, duckdb.Error):
+            return pd.DataFrame()
 
-    resultados = []
-    for item in itens_op:
-        codigo_caixa = str(item["codigo_caixa"])
+    def _converter_float(valor, default=1.0):
+        try:
+            return float(valor or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _obter_total_unidades(item):
+        codigo_caixa = str(item.get("codigo_caixa", "")).strip()
         caixas = converter_para_float(item.get("caixas"))
         pacotes = converter_para_float(item.get("pacotes"))
         unidades = converter_para_float(item.get("unidades"))
 
         if caixas == 0 and pacotes == 0 and unidades == 0:
-            continue
+            return None
 
         df_comp = _consultar_composicoes(codigo_caixa)
         if df_comp.empty:
-            continue
+            return None
 
-        # FILTRO DE RECEITAS PCP:
-        # Remove itens de embalagem/suporte (faixa 55XXXX) mantendo estritamente
-        # os componentes operacionais de receita/cozinha (ex: 102135, massas e recheios)
-        df_comp = df_comp[
-            ~df_comp["cod_insumo"].astype(str).str.strip().str.startswith("55")
-        ]
-        if df_comp.empty:
-            continue
-
-        pct_cx = float(df_comp["pct_por_cx"].iloc[0] or 1)
-        uni_pct = float(df_comp["uni_por_pct"].iloc[0] or 1)
+        desc_prod = str(df_comp["descricao_caixa"].iloc[0] or "")
+        pct_cx, uni_pct = obter_fatores_embalagem(codigo_caixa, desc_prod)
         total_unidades = (caixas * pct_cx * uni_pct) + (pacotes * uni_pct) + unidades
+        return df_comp, total_unidades
 
-        for _, row in df_comp.iterrows():
-            peso_unid_kg = float(row["peso_unid_kg"] or 0)
-            kg_liq = total_unidades * peso_unid_kg
-            lote_kg = float(row["peso_lote_receita_kg"] or 1.0)
-            if lote_kg <= 0:
-                lote_kg = 1.0
-            num_lotes = math.ceil((kg_liq / lote_kg) * 2) / 2
+    def _extrair_lote_kg(desc_insumo, lote_kg):
+        if lote_kg > 0:
+            return lote_kg
+
+        match = re.search(r"-\s*([\d,.]+)\s*(?:KG)?\s*-", desc_insumo)
+        if match:
+            try:
+                return float(match.group(1).replace(",", "."))
+            except ValueError:
+                return 1.0
+        return 1.0
+
+    def _adicionar_insumo(insumos_map, row, total_unidades):
+        cod_insumo = str(row["cod_insumo"]).strip()
+        desc_insumo = str(row.get("desc_insumo", "")).strip()
+        unidade = str(row.get("unidade", "KG")).strip()
+        linha = str(row.get("linha", "ENCAIXOTAMENTO")).strip()
+
+        if desc_insumo == cod_insumo or not desc_insumo:
+            return
+
+        peso_unid_kg = _converter_float(row.get("peso_unid_kg"), 0.0)
+        if peso_unid_kg > 0.15:
+            peso_unid_kg /= 3.0
+
+        necess_liquida_item = total_unidades * peso_unid_kg
+        lote_kg = _extrair_lote_kg(
+            desc_insumo, _converter_float(row.get("peso_lote_receita_kg"), 1.0)
+        )
+
+        if cod_insumo not in insumos_map:
+            insumos_map[cod_insumo] = {
+                "cod_insumo": cod_insumo,
+                "desc_insumo": desc_insumo,
+                "linha": linha,
+                "unidade": unidade,
+                "lote_kg": lote_kg,
+                "necessidade_liquida_kg": 0.0,
+            }
+
+        insumos_map[cod_insumo]["necessidade_liquida_kg"] += necess_liquida_item
+
+    def _montar_resultado(item):
+        nec_liq = item["necessidade_liquida_kg"]
+        lote_kg = item["lote_kg"]
+
+        if lote_kg > 0 and item["unidade"] == "KG":
+            receitas_exatas = nec_liq / lote_kg
+            num_lotes = math.ceil(receitas_exatas * 2) / 2
             total_bruto = num_lotes * lote_kg
+        else:
+            num_lotes = 1.0
+            total_bruto = nec_liq
 
-            resultados.append(
-                {
-                    "codigo_caixa": str(row["codigo_caixa"]),
-                    "descricao_caixa": row["descricao_caixa"],
-                    "linha": str(row.get("linha", "GERAL")),
-                    "total_unidades": formatar_para_scf(
-                        total_unidades, casas_decimais=0
-                    ),
-                    "cod_insumo": str(row["cod_insumo"]),
-                    "desc_insumo": row["desc_insumo"],
-                    "unidade": str(row.get("unidade", "KG")),
-                    "lote_kg_str": formatar_para_scf(lote_kg, casas_decimais=3),
-                    "total_bruto_str": formatar_para_scf(total_bruto, casas_decimais=3),
-                    "kg_liquido": formatar_para_scf(kg_liq, casas_decimais=3),
-                    "num_lotes": formatar_para_scf(num_lotes, casas_decimais=1),
-                }
-            )
+        return {
+            "cod_insumo": item["cod_insumo"],
+            "desc_insumo": item["desc_insumo"],
+            "linha": item["linha"],
+            "lote_kg_str": formatar_para_scf(lote_kg, casas_decimais=3),
+            "unidade": item["unidade"],
+            "total_bruto_str": formatar_para_scf(total_bruto, casas_decimais=3),
+            "kg_liquido": formatar_para_scf(nec_liq, casas_decimais=3),
+            "num_lotes": formatar_para_scf(num_lotes, casas_decimais=1),
+        }
 
-    return resultados
+    insumos_map = {}
+
+    for item in itens_op:
+        dados_item = _obter_total_unidades(item)
+        if dados_item is None:
+            continue
+
+        df_comp, total_unidades = dados_item
+        for _, row in df_comp.iterrows():
+            _adicionar_insumo(insumos_map, row, total_unidades)
+
+    return [_montar_resultado(item) for item in insumos_map.values()]
 
 
-# -----------------------------------------------------------------------------
-# PASTA DE HISTÓRICO DE OPs
-# -----------------------------------------------------------------------------
 OP_FOLDER = "ordens_producao_scf"
 os.makedirs(OP_FOLDER, exist_ok=True)
 
 
 def carregar_historico_ops():
-    """Carrega e retorna o histórico das ordens de produção salvas em JSON."""
+    """Carrega o histórico de ordens de produção salvas em arquivos JSON."""
     historico = []
     if not os.path.exists(OP_FOLDER):
         return historico
@@ -261,16 +391,14 @@ def carregar_historico_ops():
 
 
 # -----------------------------------------------------------------------------
-# 2. INTERFACE GRÁFICA NICEGUI COM SINCRONIZAÇÃO
+# INTERFACE GRÁFICA NICEGUI
 # -----------------------------------------------------------------------------
 @ui.page("/")
-# pylint: disable=too-many-locals,too-many-statements
 def main_page():
-    """Renderiza a interface do PCP e seu histórico."""
-
+    """Render the PCP dashboard and operation workflow UI."""
+    # pylint: disable=too-many-locals,too-many-statements
     ui.colors(primary="#1E40AF", secondary="#0D9488", accent="#F59E0B", dark="#0F172A")
 
-    # BARRA DE CABEÇALHO SUPERIOR (REBRANDING FALEIRO)
     with ui.header().classes(
         "bg-primary text-white p-4 items-center justify-between shadow-lg"
     ):
@@ -304,7 +432,6 @@ def main_page():
                     )
                     badge_fonte.text = f"Fonte: {estado_dados['fonte_atual']}"
 
-                    # Atualiza opções do dropdown de produtos usando o Part Number
                     prods = consultar_produtos()
                     select_prod.options = {
                         str(
@@ -343,11 +470,7 @@ def main_page():
         )
 
     with ui.tab_panels(tabs, value=tab_lancamento).classes("w-full bg-slate-50 p-6"):
-        # ---------------------------------------------------------------------
-        # ABA 1: GERADOR DE OP
-        # ---------------------------------------------------------------------
         with ui.tab_panel(tab_lancamento).classes("gap-6"):
-            # Card 1: Inserção de Ordens
             with ui.card().classes(
                 "w-full p-5 border border-slate-200 shadow-sm rounded-xl bg-white mb-6"
             ):
@@ -360,7 +483,7 @@ def main_page():
                         options=dict_produtos,
                         label="Selecione o Produto Final (Part Number)",
                         value=list(dict_produtos.keys())[0] if dict_produtos else None,
-                        with_input=True,  # Habilita a digitação e filtro dinâmico
+                        with_input=True,
                     ).classes("w-96")
 
                     input_cx = ui.number(
@@ -372,6 +495,34 @@ def main_page():
                     input_und = ui.number(
                         label="Unidades (UNI)", value=0, min=0, format="%.0f"
                     ).classes("w-32")
+
+                    # Card dinâmico para a Memória de Cálculo de Unidades
+                    label_memoria = ui.label("").classes(
+                        "w-full text-xs font-mono text-primary font-bold mt-2 bg-blue-50 p-2 rounded border border-blue-200"
+                    )
+
+                    def atualizar_preview_memoria():
+                        cod = select_prod.value
+                        cx = converter_para_float(input_cx.value)
+                        pct = converter_para_float(input_pct.value)
+                        und = converter_para_float(input_und.value)
+
+                        if not cod:
+                            label_memoria.text = ""
+                            return
+
+                        desc_prod = dict_produtos.get(str(cod), "")
+                        pct_cx, uni_pct = obter_fatores_embalagem(str(cod), desc_prod)
+
+                        mem_txt = gerar_memoria_calculo_unidades(
+                            cx, pct, und, pct_cx, uni_pct
+                        )
+                        label_memoria.text = f"📊 Memória de Cálculo: {mem_txt}"
+
+                    input_cx.on_value_change(atualizar_preview_memoria)
+                    input_pct.on_value_change(atualizar_preview_memoria)
+                    input_und.on_value_change(atualizar_preview_memoria)
+                    select_prod.on_value_change(atualizar_preview_memoria)
 
                     def adicionar_item_op():
                         cod = select_prod.value
@@ -385,12 +536,20 @@ def main_page():
                             )
                             return
 
+                        desc_prod = dict_produtos.get(str(cod), "")
+                        pct_cx, uni_pct = obter_fatores_embalagem(str(cod), desc_prod)
+
+                        memoria_txt = gerar_memoria_calculo_unidades(
+                            cx, pct, und, pct_cx, uni_pct
+                        )
+
                         ordem_itens.append(
                             {
                                 "codigo_caixa": cod,
                                 "caixas": cx,
                                 "pacotes": pct,
                                 "unidades": und,
+                                "memoria_calculo_unidades": memoria_txt,
                             }
                         )
                         atualizar_tabela_insumos()
@@ -403,7 +562,6 @@ def main_page():
                         "Adicionar Lote", icon="add_circle", on_click=adicionar_item_op
                     ).classes("bg-secondary text-white shadow-md")
 
-            # Card 2: Tabela de Resultados Ajustada conforme Diretrizes PCP
             with ui.card().classes(
                 "w-full p-5 border border-slate-200 shadow-sm rounded-xl bg-white"
             ):
@@ -417,6 +575,7 @@ def main_page():
                         def limpar_tudo():
                             ordem_itens.clear()
                             atualizar_tabela_insumos()
+                            label_memoria.text = ""
                             ui.notify("Ordem de Produção limpa.", type="info")
 
                         def confirmar_e_enviar_scf():
@@ -449,6 +608,7 @@ def main_page():
                             ordem_itens.clear()
                             atualizar_tabela_insumos()
                             atualizar_historico_ui()
+                            label_memoria.text = ""
                             ui.notify(
                                 f"Sucesso! {op_id} confirmada e salva para o SCF!",
                                 type="positive",
@@ -512,9 +672,6 @@ def main_page():
                     tabela.rows = dados
                     tabela.update()
 
-        # ---------------------------------------------------------------------
-        # ABA 2: HISTÓRICO E CONSULTA DE OPs DO SCF
-        # ---------------------------------------------------------------------
         with ui.tab_panel(tab_historico):
             with ui.card().classes(
                 "w-full p-5 border border-slate-200 shadow-sm rounded-xl bg-white"
@@ -523,7 +680,7 @@ def main_page():
                     "text-base font-bold text-slate-800 mb-2"
                 )
                 ui.label(
-                    "Aqui o PCP e o Chão de Fábrica (SCF) consultam todas as OPs geradas e salvas em JSON."
+                    "Consulta das Ordens de Produção salvas em JSON para o SCF."
                 ).classes("text-xs text-slate-500 mb-4")
 
                 container_historico = ui.column().classes("w-full gap-4")
