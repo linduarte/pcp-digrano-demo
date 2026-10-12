@@ -23,7 +23,7 @@ try:
     _utils_formatacao = __import__("utils_formatacao")
     _converter_para_float_impl = _utils_formatacao.converter_para_float
     _formatar_para_scf_impl = _utils_formatacao.formatar_para_scf
-except (ImportError, AttributeError):
+except ImportError, AttributeError:
 
     def _formatar_para_scf_fallback(valor: Any, casas_decimais: int = 3) -> str:
         if valor is None:
@@ -32,7 +32,7 @@ except (ImportError, AttributeError):
             val_f = float(valor)
             txt = f"{val_f:,.{casas_decimais}f}"
             return txt.replace(",", "X").replace(".", ",").replace("X", ".")
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return str(valor)
 
     def _converter_para_float_fallback(valor_raw: Any) -> float:
@@ -81,7 +81,9 @@ if executar_sincronizacao is None:
 # -----------------------------------------------------------------------------
 # FUNÇÕES AUXILIARES DE EMBALAGEM E MEMÓRIA DE CÁLCULO
 # -----------------------------------------------------------------------------
-def gerar_memoria_calculo_unidades(cx: float, pct: float, und: float, pct_por_cx: float, uni_por_pct: float) -> str:
+def gerar_memoria_calculo_unidades(
+    cx: float, pct: float, und: float, pct_por_cx: float, uni_por_pct: float
+) -> str:
     """
     Gera o texto explicativo do cálculo de unidades.
     Exemplo: (50 CX × 3 PCT × 10 UN) + (50 PCT × 10 UN) = 1.500 + 500 = 2.000 Unidades
@@ -112,7 +114,9 @@ def gerar_memoria_calculo_unidades(cx: float, pct: float, und: float, pct_por_cx
     soma_str = " + ".join(partes_soma)
 
     if len(partes) > 1:
-        return f"{formula_str} = {soma_str} = {int(total_unidades):,} Unidades".replace(",", ".")
+        return f"{formula_str} = {soma_str} = {int(total_unidades):,} Unidades".replace(
+            ",", "."
+        )
     else:
         return f"{formula_str} = {int(total_unidades):,} Unidades".replace(",", ".")
 
@@ -120,7 +124,7 @@ def gerar_memoria_calculo_unidades(cx: float, pct: float, und: float, pct_por_cx
 def obter_fatores_embalagem(codigo_caixa: str, descricao_caixa: str) -> Tuple[float, float]:
     """
     Retorna os fatores de embalagem (pct_por_cx, uni_por_pct) reais do produto.
-    Lê a ficha técnica no DuckDB e aplica fallbacks dinâmicos de descrição comercial.
+    Lê a ficha técnica no DuckDB e aplica regreamento dinâmico de descrição comercial.
     """
     pct_cx = 3.0
     uni_pct = 10.0
@@ -135,15 +139,25 @@ def obter_fatores_embalagem(codigo_caixa: str, descricao_caixa: str) -> Tuple[fl
             raw_pct = float(df_p["pct_por_cx"].iloc[0] or 0)
             raw_uni = float(df_p["uni_por_pct"].iloc[0] or 0)
 
-            # Só utiliza valores do banco se não forem o padrão genérico/legado (1 e 2)
-            if (raw_pct > 1 or raw_uni > 2) and (raw_pct * raw_uni > 2):
+            if (raw_pct > 1 or raw_uni > 1) and (raw_pct * raw_uni > 1):
                 pct_cx = raw_pct
                 uni_pct = raw_uni
     except (duckdb.Error, AttributeError, ValueError, KeyError):
         pass
 
-    # Leitura dinâmica da descrição comercial (Ex: "CX C/30" -> 3 PCT x 10 UN)
+    # Leitura e parsing dinâmico da descrição comercial do produto
     desc_upper = str(descricao_caixa).upper()
+
+    # Caso 1: Especificação direta de pacotes por caixa (Ex: "CX C/ 4 PCT")
+    match_pct = re.search(r"CX\s*C/\s*(\d+)\s*PCT", desc_upper)
+    if match_pct:
+        pct_cx = float(match_pct.group(1))
+        # Para esfirras/folhados com 4 pct por caixa, uni_por_pct padrão é 5
+        if pct_cx == 4.0:
+            uni_pct = 5.0
+        return pct_cx, uni_pct
+
+    # Caso 2: Especificação de unidades totais por caixa (Ex: "CX C/30")
     match_cx = re.search(r"CX\s*C/\s*(\d+)", desc_upper) or re.search(r"CX\s*(\d+)", desc_upper)
     if match_cx:
         try:
@@ -254,13 +268,13 @@ def calcular_ordem_duckdb(itens_op):
         """
         try:
             return estado_dados["con_duck"].execute(query, [codigo_caixa]).df()
-        except (AttributeError, TypeError, ValueError, duckdb.Error):
+        except AttributeError, TypeError, ValueError, duckdb.Error:
             return pd.DataFrame()
 
     def _converter_float(valor, default=1.0):
         try:
             return float(valor or default)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return default
 
     def _obter_total_unidades(item):
@@ -279,7 +293,8 @@ def calcular_ordem_duckdb(itens_op):
         desc_prod = str(df_comp["descricao_caixa"].iloc[0] or "")
         pct_cx, uni_pct = obter_fatores_embalagem(codigo_caixa, desc_prod)
         total_unidades = (caixas * pct_cx * uni_pct) + (pacotes * uni_pct) + unidades
-        return df_comp, total_unidades
+        total_unidades_caixa = pct_cx * uni_pct
+        return df_comp, total_unidades, total_unidades_caixa
 
     def _extrair_lote_kg(desc_insumo, lote_kg):
         if lote_kg > 0:
@@ -293,18 +308,23 @@ def calcular_ordem_duckdb(itens_op):
                 return 1.0
         return 1.0
 
-    def _adicionar_insumo(insumos_map, row, total_unidades):
+    def _adicionar_insumo(insumos_map, row, total_unidades, total_unidades_caixa):
         cod_insumo = str(row["cod_insumo"]).strip()
         desc_insumo = str(row.get("desc_insumo", "")).strip()
         unidade = str(row.get("unidade", "KG")).strip()
         linha = str(row.get("linha", "ENCAIXOTAMENTO")).strip()
 
+        # Filtra itens sem descrição válida (órfãos)
         if desc_insumo == cod_insumo or not desc_insumo:
             return
 
-        peso_unid_kg = _converter_float(row.get("peso_unid_kg"), 0.0)
-        if peso_unid_kg > 0.15:
-            peso_unid_kg /= 3.0
+        raw_peso = _converter_float(row.get("peso_unid_kg"), 0.0)
+
+        # Normalização: se o peso do SCF estiver cadastrado por caixa (ex: 0.840 KG/cx), converte para KG/unid
+        if raw_peso > 0.15 and total_unidades_caixa > 1:
+            peso_unid_kg = raw_peso / total_unidades_caixa
+        else:
+            peso_unid_kg = raw_peso
 
         necess_liquida_item = total_unidades * peso_unid_kg
         lote_kg = _extrair_lote_kg(
@@ -341,9 +361,9 @@ def calcular_ordem_duckdb(itens_op):
             "linha": item["linha"],
             "lote_kg_str": formatar_para_scf(lote_kg, casas_decimais=3),
             "unidade": item["unidade"],
+            "num_lotes": formatar_para_scf(num_lotes, casas_decimais=1),
             "total_bruto_str": formatar_para_scf(total_bruto, casas_decimais=3),
             "kg_liquido": formatar_para_scf(nec_liq, casas_decimais=3),
-            "num_lotes": formatar_para_scf(num_lotes, casas_decimais=1),
         }
 
     insumos_map = {}
@@ -353,9 +373,9 @@ def calcular_ordem_duckdb(itens_op):
         if dados_item is None:
             continue
 
-        df_comp, total_unidades = dados_item
+        df_comp, total_unidades, total_unidades_caixa = dados_item
         for _, row in df_comp.iterrows():
-            _adicionar_insumo(insumos_map, row, total_unidades)
+            _adicionar_insumo(insumos_map, row, total_unidades, total_unidades_caixa)
 
     return [_montar_resultado(item) for item in insumos_map.values()]
 
@@ -385,7 +405,7 @@ def carregar_historico_ops():
                             "raw_json": data,
                         }
                     )
-            except (OSError, json.JSONDecodeError):
+            except OSError, json.JSONDecodeError:
                 pass
     return historico
 
@@ -625,42 +645,13 @@ def main_page():
                         ).classes("bg-primary text-white shadow-md")
 
                 colunas_tabela = [
-                    {
-                        "name": "cod_insumo",
-                        "label": "Código",
-                        "field": "cod_insumo",
-                        "align": "left",
-                    },
-                    {
-                        "name": "desc_insumo",
-                        "label": "Descrição do Insumo",
-                        "field": "desc_insumo",
-                        "align": "left",
-                    },
-                    {
-                        "name": "linha",
-                        "label": "Linha",
-                        "field": "linha",
-                        "align": "left",
-                    },
-                    {
-                        "name": "lote_kg_str",
-                        "label": "Lote Padrão",
-                        "field": "lote_kg_str",
-                        "align": "right",
-                    },
-                    {
-                        "name": "unidade",
-                        "label": "Unidade",
-                        "field": "unidade",
-                        "align": "center",
-                    },
-                    {
-                        "name": "total_bruto_str",
-                        "label": "Total bruto a preparar",
-                        "field": "total_bruto_str",
-                        "align": "right",
-                    },
+                    {"name": "cod_insumo", "label": "Código", "field": "cod_insumo", "align": "left"},
+                    {"name": "desc_insumo", "label": "Descrição do Insumo", "field": "desc_insumo", "align": "left"},
+                    {"name": "linha", "label": "Linha", "field": "linha", "align": "left"},
+                    {"name": "lote_kg_str", "label": "Lote Padrão", "field": "lote_kg_str", "align": "right"},
+                    {"name": "unidade", "label": "Unidade", "field": "unidade", "align": "center"},
+                    {"name": "num_lotes", "label": "Nº Receitas (Regra 0.5)", "field": "num_lotes", "align": "right"},
+                    {"name": "total_bruto_str", "label": "Total bruto a preparar", "field": "total_bruto_str", "align": "right"},
                 ]
 
                 tabela = ui.table(
