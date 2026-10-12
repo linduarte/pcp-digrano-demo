@@ -1,4 +1,4 @@
-# 🏭 Sistema de PCP - Linha de Alimentos (DiGrano)
+# 🏭 Sistema de PCP - Linha de Alimentos Faleiro
 
 Uma aplicação moderna, leve e de alta performance desenvolvida em **Python** para Planejamento e Controle da Produção (PCP). O sistema realiza a explosão instantânea de ordens de produção em insumos e semiacabados (massas, recheios e acabamentos) e calcula o loteamento exato de receitas para a cozinha.
 
@@ -103,6 +103,67 @@ Lançamento de Ordens: Selecione o produto desejado na lista, introduza a quanti
     Nº de Receitas (0.5): Quantidade ajustada de lotes a serem produzidos (arredondado para o meio lote superior).
 
     Total Bruto a Preparar (KG): Quantidade final a enviar para a cozinha/misturador.
+
+
+
+## 📄 Documentação Arquitetural e Fluxo de Integração (PCP / SCF / ERP)
+
+### 📌 Esclarecimentos de Conceito e Arquitetura
+
+#### 1. Formato de Exportação e Payload JSON
+
+O envio das Ordens de Produção (OPs) é realizado nativamente em formato **JSON**. Ao acionar a confirmação da ordem no painel, o sistema compila a demanda consolidada e gera um arquivo `.json` estruturado na pasta `ordens_producao_scf/`.
+
+O contrato de dados é composto por dois blocos principais:
+
+* **`programacao_produtos`**: Contém a intenção comercial definida pelo operador no PCP, preservando as entradas em Caixas (CX), Pacotes (PCT) e Unidades (UNI), além da memória de cálculo auditável.
+* **`explosao_insumos`**: Apresenta a consolidação das necessidades líquidas de matéria-prima e a quantidade final de receitas arredondadas conforme os lotes industriais.
+
+---
+
+#### 2. O que é o "Gerador de OP / Explosão de Insumos"?
+
+Esta aba concentra as duas etapas centrais do processo de Planejamento e Controle da Produção:
+
+* **Gerador de OP (Lançamento de Demanda Multi-Produto)**:Interface operacional para traduzir previsões de vendas, pedidos ou metas de estoque em ordens reais de fabricação. Aceita múltiplas combinações de embalagens para o mesmo item e exibe a memória de cálculo física unificada (total de unidades salgadas).
+* **Explosão de Insumos (BOM Explosion)**:
+  Motor matemático baseado em DuckDB que percorre dinamicamente a árvore de produto (Ficha Técnica / Árvore BOM do SCF). A engine decompoe a necessidade do produto acabado em seus constituintes intermediários (massa, recheio, frios), normaliza os consumos unitários e aplica a **Regra do Lote 0.5** para cálculo do número exato de receitas a preparar.
+
+---
+
+### 🔄 Fluxo de Envio Simultâneo (PCP ➔ SCF & ERP)
+
+Para assegurar o alinhamento entre o chão de fábrica (SCF) e a gestão administrativa/financeira (ERP), as Ordens de Produção geradas pelo PCP operam no seguinte fluxo de integração:
+
+```
+                         ┌─────────────────────────────┐
+                         │   PCP Dashboard (NiceGUI)   │
+                         └──────────────┬──────────────┘
+                                        │
+                                        ▼  (Gera Payload JSON com OP_ID)
+                         ┌─────────────────────────────┐
+                         │   Payload JSON Estruturado  │
+                         └──────────────┬──────────────┘
+                                        │
+                 ┌──────────────────────┴──────────────────────┐
+                 ▼                                             ▼
+  ┌─────────────────────────────┐               ┌─────────────────────────────┐
+  │         Módulo SCF          │               │         Módulo ERP          │
+  │     (Chão de Fábrica)       │               │ (Gestão de Estoque/Custos)  │
+  ├─────────────────────────────┤               ├─────────────────────────────┤
+  │ • Apontamento de Lotes      │               │ • Baixa de Matéria-Prima    │
+  │ • Programação de Linha      │               │ • Custo Industrial / COGS   │
+  │ • Controle de Preparação    │               │ • Faturamento & Ordens      │
+  └─────────────────────────────┘               └─────────────────────────────┘
+```
+
+#### Estratégias para Conexão com o ERP:
+
+1. **Integração Direta via Banco de Dados (Staging Table / Stored Procedures)**:Mapeamento de views e tabelas de interface no SQL Server/PostgreSQL do ERP onde os dados do payload JSON são inseridos diretamente.
+2. **Consumo de API REST / Webhook**:Envio assíncrono via requisição `HTTP POST` disparada pelo NiceGUI para o endpoint de importação de ordens do ERP.
+3. **Monitoramento de Pasta (Folder Watcher)**:
+   Serviço em segundo plano no ERP que consome e processa automaticamente os arquivos JSON salvos no diretório compartilhado.
+
 
 📄 Licença
 Este projeto foi desenvolvido para fins de demonstração técnica e otimização de processos fabris.
