@@ -242,7 +242,6 @@ def calcular_ordem_duckdb(itens_op):
         raw_str = str(codigo_caixa or "").strip()
         cod_limpo = raw_str.split("-")[0].strip() if "-" in raw_str else raw_str
 
-        # CASO ESPECIAL: Se for um semiacabado SCF, procura por código direto ou correspondência parcial
         if cod_limpo.upper().startswith("SCF"):
             query_scf = """
                 SELECT
@@ -270,10 +269,9 @@ def calcular_ordem_duckdb(itens_op):
                 )
                 if not df_scf.empty:
                     return df_scf
-            except AttributeError, TypeError, ValueError, duckdb.Error:
+            except (AttributeError, TypeError, ValueError, duckdb.Error):
                 pass
 
-        # CASO PADRÃO (Homologado para produtos comerciais 10...)
         query_padrao = """
             SELECT
                 TRIM(CAST(codigo_caixa AS VARCHAR)) AS codigo_caixa,
@@ -293,7 +291,7 @@ def calcular_ordem_duckdb(itens_op):
         """
         try:
             return estado_dados["con_duck"].execute(query_padrao, [cod_limpo]).df()
-        except AttributeError, TypeError, ValueError, duckdb.Error:
+        except (AttributeError, TypeError, ValueError, duckdb.Error):
             return pd.DataFrame()
 
     def _obter_total_unidades(item):
@@ -327,19 +325,23 @@ def calcular_ordem_duckdb(itens_op):
 
         return df_comp, total_unidades, total_unidades_caixa
 
-    def _adicionar_insumo(insumos_map, row, total_unidades, total_unidades_caixa):
+    def _adicionar_insumo(
+        insumos_map,
+        row,
+        total_unidades,
+        total_unidades_caixa,
+        cod_produto_origem: str = "",
+    ):
         cod_insumo = str(row.get("cod_insumo", "") or "").strip()
         desc_insumo = str(row.get("desc_insumo", "") or "").strip()
         unidade = str(row.get("unidade", "KG") or "KG").strip()
         linha = str(row.get("linha", "ENCAIXOTAMENTO") or "ENCAIXOTAMENTO").strip()
 
-        # Descarta códigos de embalagem comercial (10...) que não sejam insumos
         if not cod_insumo or cod_insumo.startswith("10") or desc_insumo == cod_insumo:
             return
 
         raw_peso = float(row.get("peso_unid_kg") or 0.0)
 
-        # Se o peso veio acumulado por caixa, divide pelo total de unidades da caixa
         if total_unidades_caixa > 1 and raw_peso > 0.15:
             peso_unid_kg = raw_peso / total_unidades_caixa
         else:
@@ -356,23 +358,18 @@ def calcular_ordem_duckdb(itens_op):
                 "unidade": unidade,
                 "lote_kg": lote_kg,
                 "necessidade_liquida_kg": 0.0,
+                "produtos_origem": set(),
             }
 
         insumos_map[cod_insumo]["necessidade_liquida_kg"] += necess_liquida_item
-
-    insumos_map = {}
-    for item in itens_op:
-        dados_item = _obter_total_unidades(item)
-        if dados_item is None:
-            continue
-
-        df_comp, total_unidades, total_unidades_caixa = dados_item
-        for _, row in df_comp.iterrows():
-            _adicionar_insumo(insumos_map, row, total_unidades, total_unidades_caixa)
+        if cod_produto_origem:
+            insumos_map[cod_insumo]["produtos_origem"].add(cod_produto_origem)
 
     def _montar_resultado(item):
         nec_liq = item["necessidade_liquida_kg"]
         lote_kg = item["lote_kg"]
+        qtd_prods = len(item.get("produtos_origem", set()))
+        foi_somado = qtd_prods > 1
 
         if lote_kg > 0 and item["unidade"] == "KG":
             receitas_exatas = nec_liq / lote_kg
@@ -382,27 +379,42 @@ def calcular_ordem_duckdb(itens_op):
             num_lotes = 1.0
             total_bruto = nec_liq
 
+        # Retorna o texto limpo para o Quasar estilizar via template
+        desc_exibida = (
+            f"{item['desc_insumo']} (Soma de {qtd_prods} produtos)"
+            if foi_somado
+            else item["desc_insumo"]
+        )
+
         return {
             "cod_insumo": item["cod_insumo"],
-            "desc_insumo": item["desc_insumo"],
+            "desc_insumo": desc_exibida,
             "linha": item["linha"],
             "lote_kg_str": formatar_para_scf(lote_kg, casas_decimais=3),
             "unidade": item["unidade"],
             "num_lotes": formatar_para_scf(num_lotes, casas_decimais=1),
             "total_bruto_str": formatar_para_scf(total_bruto, casas_decimais=3),
             "kg_liquido": formatar_para_scf(nec_liq, casas_decimais=3),
+            "somado": foi_somado,
         }
 
     insumos_map = {}
-
     for item in itens_op:
         dados_item = _obter_total_unidades(item)
         if dados_item is None:
             continue
 
         df_comp, total_unidades, total_unidades_caixa = dados_item
+        cod_produto_origem = str(item.get("codigo_caixa", "")).strip()
+
         for _, row in df_comp.iterrows():
-            _adicionar_insumo(insumos_map, row, total_unidades, total_unidades_caixa)
+            _adicionar_insumo(
+                insumos_map,
+                row,
+                total_unidades,
+                total_unidades_caixa,
+                cod_produto_origem=cod_produto_origem,
+            )
 
     return [_montar_resultado(item) for item in insumos_map.values()]
 
@@ -672,53 +684,71 @@ def main_page():
                         ).classes("bg-primary text-white shadow-md")
 
                 colunas_tabela = [
-                    {
-                        "name": "cod_insumo",
-                        "label": "Código",
-                        "field": "cod_insumo",
-                        "align": "left",
-                    },
-                    {
-                        "name": "desc_insumo",
-                        "label": "Descrição do Insumo",
-                        "field": "desc_insumo",
-                        "align": "left",
-                    },
-                    {
-                        "name": "linha",
-                        "label": "Linha",
-                        "field": "linha",
-                        "align": "left",
-                    },
-                    {
-                        "name": "lote_kg_str",
-                        "label": "Lote Padrão",
-                        "field": "lote_kg_str",
-                        "align": "right",
-                    },
-                    {
-                        "name": "unidade",
-                        "label": "Unidade",
-                        "field": "unidade",
-                        "align": "center",
-                    },
-                    {
-                        "name": "num_lotes",
-                        "label": "Nº Receitas (Regra 0.5)",
-                        "field": "num_lotes",
-                        "align": "right",
-                    },
-                    {
-                        "name": "total_bruto_str",
-                        "label": "Total bruto a preparar",
-                        "field": "total_bruto_str",
-                        "align": "right",
-                    },
+                {
+                    "name": "cod_insumo",
+                    "label": "Código",
+                    "field": "cod_insumo",
+                    "align": "left",
+                },
+                {
+                    "name": "desc_insumo",
+                    "label": "Descrição do Insumo",
+                    "field": "desc_insumo",
+                    "align": "left",
+                    "html": True,  # <--- CRÍTICO para permitir renderização de estilos inline
+                },
+                {
+                    "name": "linha",
+                    "label": "Linha",
+                    "field": "linha",
+                    "align": "left",
+                },
+                {
+                    "name": "lote_kg_str",
+                    "label": "Lote Padrão",
+                    "field": "lote_kg_str",
+                    "align": "right",
+                },
+                {
+                    "name": "unidade",
+                    "label": "Unidade",
+                    "field": "unidade",
+                    "align": "center",
+                },
+                {
+                    "name": "num_lotes",
+                    "label": "Nº Receitas (Regra 0.5)",
+                    "field": "num_lotes",
+                    "align": "right",
+                },
+                {
+                    "name": "total_bruto_str",
+                    "label": "Total bruto a preparar",
+                    "field": "total_bruto_str",
+                    "align": "right",
+                },
                 ]
 
                 tabela = ui.table(
                     columns=colunas_tabela, rows=[], row_key="cod_insumo"
                 ).classes("w-full shadow-none border border-slate-200 rounded-lg")
+
+# Slot nativo do Quasar para renderizar a etiqueta em Azul Claro suave
+                tabela.add_slot(
+                    "body-cell-desc_insumo",
+                    """
+                    <q-td :props="props">
+                        <template v-if="props.row.somado">
+                            <span class="bg-blue-1 text-blue-10 text-bold q-pa-xs rounded border border-blue-3">
+                                🔀 {{ props.row.desc_insumo }}
+                            </span>
+                        </template>
+                        <template v-else>
+                            {{ props.row.desc_insumo }}
+                        </template>
+                    </q-td>
+                    """,
+                )
 
                 def atualizar_tabela_insumos():
                     dados = calcular_ordem_duckdb(ordem_itens)
@@ -793,4 +823,5 @@ def main_page():
                 atualizar_historico_ui()
 
 
-ui.run(title="PCP Faleiro - NiceGUI & DuckDB", port=8085, reload=False)
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(title="PCP Faleiro - NiceGUI & DuckDB", port=8085, reload=False)
