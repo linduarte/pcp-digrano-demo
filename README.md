@@ -12,6 +12,18 @@ Uma aplicação moderna, leve e de alta performance desenvolvida em **Python** p
 * **Gestão Leve de Dependências**: Configurado e gerenciado com o **`uv`**, dispensando infraestruturas pesadas como Docker ou bases de dados complexas.
 
 ---
+## 🔀 Consolidação Multi-Produto & Explosão de Dependências (MRP)
+
+O dashboard conta com um motor de explosão de **Bill of Materials (BOM)** em **DuckDB**, capaz de consolidar demandas de insumos a partir de intenções de produção multi-produto na Ordem de Produção (OP).
+
+### 🚀 Destaques da Funcionalidade
+
+- **Arcabouço Fixo de Conversão de Unidades**: Normalização automática e imutável do peso unitário dos insumos (`threshold` de `0.20 kg`), garantindo precisão matemática independente da ficha técnica (itens por caixa vs. itens por unidade física individual).
+- **Consolidação Inteligente de Insumos Compartilhados**: Agrupamento automático de matérias-primas e semiacabados comuns a múltiplos produtos finais lançados na OP.
+- **Sinalização Visual no PCP**: Insumos consolidados de múltiplos produtos são sinalizados dinamicamente na tabela com a etiqueta **Azul Claro (`bg-blue-1 text-blue-10`)** e o ícone `🔀 (Soma de N produtos)`.
+- **Cálculo de Lotes e Regra de Arredondamento (0.5)**: Determinação exata do número de receitas e do total bruto a preparar com base no peso do lote padrão de cada receita.
+
+---
 
 ## 📐 Estrutura do Banco / Modelo de Dados
 
