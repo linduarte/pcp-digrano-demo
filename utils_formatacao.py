@@ -4,21 +4,21 @@ Módulo utilitário para tratamento e conversão de separadores decimais e de mi
 entre o padrão internacional (Python/DuckDB/AtacK) e o padrão brasileiro PT-BR (SCF).
 """
 
-from typing import Any, Union
+from typing import Any
 
 
-def formatar_para_scf(valor: Union[float, int, None], casas_decimais: int = 2) -> str:
+def formatar_para_scf(valor: float | None, casas_decimais: int = 2) -> str:
     """
     Converte um número (float/int) para string no padrão PT-BR esperado pelo SCF.
     Exemplo: 4300.5 -> "4.300,50"
     """
     if valor is None:
-        return f"0,{ '0' * casas_decimais }"
+        return f"0,{'0' * casas_decimais}"
 
     try:
         valor_float = float(valor)
-    except (ValueError, TypeError):
-        return f"0,{ '0' * casas_decimais }"
+    except ValueError, TypeError:
+        return f"0,{'0' * casas_decimais}"
 
     # Formata com vírgula para milhar e ponto para decimal temporariamente
     texto_formatado = f"{valor_float:,.{casas_decimais}f}"
@@ -48,5 +48,5 @@ def converter_para_float(valor_raw: Any) -> float:
 
     try:
         return float(texto)
-    except ValueError:
+    except ValueError, TypeError:
         return 0.0

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 try:
     import pyodbc  # type: ignore[import-not-found]
@@ -32,7 +33,7 @@ def _carregar_obter_conexao_sql() -> ConexaoSql | None:
         modulo: ModuleType = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(modulo)
         funcao = getattr(modulo, "OBTER_CONEXAO_SQL", None)
-    except (ImportError, OSError, RuntimeError):
+    except ImportError, OSError, RuntimeError:
         return None
 
     return cast(ConexaoSql, funcao) if callable(funcao) else None
@@ -44,7 +45,9 @@ def _criar_conexao_sql() -> Any:
         raise RuntimeError("O pacote pyodbc não está instalado.")
 
     caminho_modulo = Path(__file__).resolve().with_name("sincronizar_scf.py")
-    spec = importlib.util.spec_from_file_location("sincronizar_scf_config", caminho_modulo)
+    spec = importlib.util.spec_from_file_location(
+        "sincronizar_scf_config", caminho_modulo
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("Não foi possível carregar a configuração do sincronizador.")
 
@@ -52,7 +55,7 @@ def _criar_conexao_sql() -> Any:
     spec.loader.exec_module(modulo)
     configuracao = getattr(modulo, "DB_CONFIG", None)
     if not isinstance(configuracao, dict):
-        raise RuntimeError("DB_CONFIG não foi encontrada no módulo sincronizar_scf.")
+        raise TypeError("DB_CONFIG não foi encontrada no módulo sincronizar_scf.")
 
     configuracao_sql = cast(dict[str, str], configuracao)
 

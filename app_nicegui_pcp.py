@@ -11,7 +11,8 @@ import math
 import os
 import re
 import sys
-from typing import Any, Callable, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import duckdb
 import pandas as pd
@@ -23,7 +24,7 @@ try:
     _utils_formatacao = __import__("utils_formatacao")
     _converter_para_float_impl = _utils_formatacao.converter_para_float
     _formatar_para_scf_impl = _utils_formatacao.formatar_para_scf
-except ImportError, AttributeError:
+except AttributeError, TypeError, ValueError, duckdb.Error:
 
     def _formatar_para_scf_fallback(valor: Any, casas_decimais: int = 3) -> str:
         if valor is None:
@@ -32,7 +33,7 @@ except ImportError, AttributeError:
             val_f = float(valor)
             txt = f"{val_f:,.{casas_decimais}f}"
             return txt.replace(",", "X").replace(".", ",").replace("X", ".")
-        except ValueError, TypeError:
+        except AttributeError, TypeError, ValueError, duckdb.Error:
             return str(valor)
 
     def _converter_para_float_fallback(valor_raw: Any) -> float:
@@ -43,7 +44,7 @@ except ImportError, AttributeError:
         try:
             texto = str(valor_raw).strip().replace(".", "").replace(",", ".")
             return float(texto)
-        except ValueError:
+        except ValueError, TypeError:
             return 0.0
 
     _formatar_para_scf_impl = _formatar_para_scf_fallback
@@ -60,7 +61,7 @@ def converter_para_float(valor: Any) -> float:
     return _converter_para_float_impl(valor)
 
 
-executar_sincronizacao: Optional[Callable[[], Any]] = None
+executar_sincronizacao: Callable[[], Any] | None = None
 
 for _nome_modulo_scf in ("sincronizar_scf", "src.sincronizar_scf"):
     try:
@@ -122,7 +123,7 @@ def gerar_memoria_calculo_unidades(
 
 def obter_fatores_embalagem(
     codigo_caixa: str, descricao_caixa: str
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Retorna os fatores exatos de embalagem para homologação conforme a planilha/BOM."""
     str_cod = str(codigo_caixa).strip()
 
@@ -177,7 +178,7 @@ def carregar_dados_duckdb():
 
     if os.path.exists(ndjson_file) and os.path.getsize(ndjson_file) > 0:
         con.execute(f"""
-            CREATE TABLE fichas_tecnicas AS 
+            CREATE TABLE fichas_tecnicas AS
             SELECT * FROM read_ndjson_auto('{ndjson_file}')
         """)
         source_mode = "SCF NDJSON (SQL Server)"
@@ -190,7 +191,7 @@ def carregar_dados_duckdb():
 
         con.execute("""
             CREATE TABLE fichas_tecnicas AS
-            SELECT 
+            SELECT
                 CAST(p.Codigo_Caixa AS VARCHAR) AS codigo_caixa,
                 p.Descricao_Caixa AS descricao_caixa,
                 p.Linha AS linha,
@@ -225,8 +226,8 @@ def consultar_produtos():
     return (
         estado_dados["con_duck"]
         .execute("""
-        SELECT CAST(codigo_caixa AS VARCHAR) AS codigo_caixa, descricao_caixa, linha, pct_por_cx, uni_por_pct 
-        FROM fichas_tecnicas 
+        SELECT CAST(codigo_caixa AS VARCHAR) AS codigo_caixa, descricao_caixa, linha, pct_por_cx, uni_por_pct
+        FROM fichas_tecnicas
         ORDER BY codigo_caixa
     """)
         .df()
@@ -575,7 +576,7 @@ def main_page():
                         ui.select(
                             options=dict_produtos,
                             label="Selecione o Produto Final (Part Number)",
-                            value=list(dict_produtos.keys())[0]
+                            value=next(iter(dict_produtos.keys()))
                             if dict_produtos
                             else None,
                             with_input=True,
@@ -802,72 +803,77 @@ def main_page():
                     tabela.rows = dados
                     tabela.update()
 
-        with ui.tab_panel(tab_historico):
-            with ui.card().classes(
+        with (
+            ui.tab_panel(tab_historico),
+            ui.card().classes(
                 "w-full p-5 border border-slate-200 shadow-sm rounded-xl bg-white"
-            ):
-                ui.label("Histórico de Ordens de Produção Confirmadas").classes(
-                    "text-base font-bold text-slate-800 mb-2"
-                )
-                ui.label(
-                    "Consulta das Ordens de Produção salvas em JSON para o SCF."
-                ).classes("text-xs text-slate-500 mb-4")
+            ),
+        ):
+            ui.label("Histórico de Ordens de Produção Confirmadas").classes(
+                "text-base font-bold text-slate-800"
+            )
+            ui.label(
+                "Consulta das Ordens de Produção salvas em JSON para o SCF."
+            ).classes("text-xs text-slate-500 mb-4")
 
-                container_historico = ui.column().classes("w-full gap-4")
+            container_historico = ui.column().classes("w-full gap-4")
 
-                def visualizar_json_dialog(raw_data):
+            def visualizar_json_dialog(raw_data):
+                with (
+                    ui.dialog() as dialog,
+                    ui.card().classes("w-full max-w-3xl p-6"),
+                ):
+                    ui.label(f"Payload JSON da {raw_data.get('op_id')}").classes(
+                        "text-lg font-bold text-slate-800 mb-2"
+                    )
+                    ui.code(
+                        json.dumps(raw_data, indent=2, ensure_ascii=False),
+                        language="json",
+                    ).classes(
+                        "w-full max-h-96 overflow-y-auto bg-slate-900 text-green-400 p-4 rounded-lg font-mono text-xs"
+                    )
+                    ui.button("Fechar", on_click=dialog.close).classes(
+                        "mt-4 bg-slate-700 text-white"
+                    )
+                dialog.open()
+
+            def atualizar_historico_ui():
+                container_historico.clear()
+                dados_hist = carregar_historico_ops()
+
+                if not dados_hist:
+                    with container_historico:
+                        ui.label(
+                            "Nenhuma Ordem de Produção salva até o momento."
+                        ).classes("text-slate-400 italic text-sm p-4")
+                    return
+
+                for op in dados_hist:
                     with (
-                        ui.dialog() as dialog,
-                        ui.card().classes("w-full max-w-3xl p-6"),
+                        container_historico,
+                        ui.card().classes(
+                            "w-full p-4 border border-slate-200 rounded-lg bg-slate-50 flex-row items-center justify-between"
+                        ),
                     ):
-                        ui.label(f"Payload JSON da {raw_data.get('op_id')}").classes(
-                            "text-lg font-bold text-slate-800 mb-2"
-                        )
-                        ui.code(
-                            json.dumps(raw_data, indent=2, ensure_ascii=False),
-                            language="json",
-                        ).classes(
-                            "w-full max-h-96 overflow-y-auto bg-slate-900 text-green-400 p-4 rounded-lg font-mono text-xs"
-                        )
-                        ui.button("Fechar", on_click=dialog.close).classes(
-                            "mt-4 bg-slate-700 text-white"
-                        )
-                    dialog.open()
-
-                def atualizar_historico_ui():
-                    container_historico.clear()
-                    dados_hist = carregar_historico_ops()
-                    if not dados_hist:
-                        with container_historico:
+                        with ui.row().classes("items-center gap-6"):
+                            ui.badge(op["id"], color="primary").classes(
+                                "text-sm px-3 py-1 font-mono"
+                            )
+                            ui.label(f"Data: {op['data_hora']}").classes(
+                                "text-sm text-slate-600"
+                            )
                             ui.label(
-                                "Nenhuma Ordem de Produção salva até o momento."
-                            ).classes("text-slate-400 italic text-sm p-4")
-                        return
+                                f"Produtos: {op['qtd_produtos']} | Insumos Explosão: {op['qtd_insumos']}"
+                            ).classes("text-sm font-semibold text-slate-800")
 
-                    for op in dados_hist:
-                        with container_historico:
-                            with ui.card().classes(
-                                "w-full p-4 border border-slate-200 rounded-lg bg-slate-50 flex-row items-center justify-between"
-                            ):
-                                with ui.row().classes("items-center gap-6"):
-                                    ui.badge(op["id"], color="primary").classes(
-                                        "text-sm px-3 py-1 font-mono"
-                                    )
-                                    ui.label(f"Data: {op['data_hora']}").classes(
-                                        "text-sm text-slate-600"
-                                    )
-                                    ui.label(
-                                        f"Produtos: {op['qtd_produtos']} | Insumos Explosão: {op['qtd_insumos']}"
-                                    ).classes("text-sm font-semibold text-slate-800")
+                        raw = op["raw_json"]
+                        ui.button(
+                            "Ver JSON do SCF",
+                            icon="code",
+                            on_click=lambda _, r=raw: visualizar_json_dialog(r),
+                        ).classes("bg-secondary text-white text-xs")
 
-                                raw = op["raw_json"]
-                                ui.button(
-                                    "Ver JSON do SCF",
-                                    icon="code",
-                                    on_click=lambda _, r=raw: visualizar_json_dialog(r),
-                                ).classes("bg-secondary text-white text-xs")
-
-                atualizar_historico_ui()
+            atualizar_historico_ui()
 
 
 if __name__ in {"__main__", "__mp_main__"}:

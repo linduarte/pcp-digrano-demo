@@ -21,10 +21,10 @@ cursor = conn.cursor()
 
 print("\n--- ESTRUTURA DO PRODUTO PARA SCF001 / CHARUTINHO ---")
 cursor.execute("""
-    SELECT DISTINCT 
-        RTRIM(v.codigoProduto) AS cod_produto_view, 
-        RTRIM(v.codigoInsumo) AS cod_insumo_view, 
-        v.quantidadeInsumo 
+    SELECT DISTINCT
+        RTRIM(v.codigoProduto) AS cod_produto_view,
+        RTRIM(v.codigoInsumo) AS cod_insumo_view,
+        v.quantidadeInsumo
     FROM dbo.viewEstruturaProduto v
     WHERE UPPER(v.codigoProduto) LIKE '%SCF%'
        OR UPPER(v.codigoProduto) LIKE '%11810%'

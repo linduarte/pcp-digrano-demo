@@ -21,7 +21,7 @@ DB_CONFIG = {
 # Consulta SQL simplificada, explícita e compatível com o SQL Server
 QUERY_SCF = """
 WITH CTE_ArvoreBOM AS (
-    SELECT 
+    SELECT
         RTRIM(e.codigoProduto) COLLATE DATABASE_DEFAULT AS codigo_pai,
         RTRIM(e.codigoInsumo) COLLATE DATABASE_DEFAULT AS codigo_filho,
         CAST(e.quantidadeInsumo AS FLOAT) AS qtd_acumulada,
@@ -30,17 +30,17 @@ WITH CTE_ArvoreBOM AS (
 
     UNION ALL
 
-    SELECT 
+    SELECT
         a.codigo_pai,
         RTRIM(e2.codigoInsumo) COLLATE DATABASE_DEFAULT AS codigo_filho,
         CAST(a.qtd_acumulada * e2.quantidadeInsumo AS FLOAT) AS qtd_acumulada,
         a.profundidade + 1
     FROM CTE_ArvoreBOM a
-    INNER JOIN dbo.viewEstruturaProduto e2 
+    INNER JOIN dbo.viewEstruturaProduto e2
         ON a.codigo_filho = RTRIM(e2.codigoProduto) COLLATE DATABASE_DEFAULT
     WHERE a.profundidade < 5
 )
-SELECT 
+SELECT
     p.codigoInterno AS id_interno_scf,
     ISNULL(NULLIF(RTRIM(p.partNumber), ''), CAST(p.codigoInterno AS VARCHAR)) AS codigo_caixa,
     p.nome AS descricao_caixa,
@@ -62,15 +62,15 @@ SELECT
             COALESCE(MAX(pg_ins.peso), 1.0) AS peso_lote_receita_kg,
             'KG' AS unidade
         FROM CTE_ArvoreBOM i_sub
-        LEFT JOIN dbo.produtoGeral pg_ins 
+        LEFT JOIN dbo.produtoGeral pg_ins
             ON (RTRIM(i_sub.codigo_filho) = RTRIM(pg_ins.partNumber) COLLATE DATABASE_DEFAULT
                 OR RTRIM(i_sub.codigo_filho) = CAST(pg_ins.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT)
-        LEFT JOIN dbo.insumo i 
-            ON (RTRIM(i_sub.codigo_filho) = RTRIM(i.codigoExterno) COLLATE DATABASE_DEFAULT 
+        LEFT JOIN dbo.insumo i
+            ON (RTRIM(i_sub.codigo_filho) = RTRIM(i.codigoExterno) COLLATE DATABASE_DEFAULT
                 OR RTRIM(i_sub.codigo_filho) = CAST(i.codigoInterno AS VARCHAR(50)) COLLATE DATABASE_DEFAULT)
-        LEFT JOIN dbo.categoriaInsumo c 
+        LEFT JOIN dbo.categoriaInsumo c
             ON i.categoriaInsumo = c.codigoInterno
-        WHERE 
+        WHERE
             (RTRIM(i_sub.codigo_pai) = RTRIM(p.partNumber) COLLATE DATABASE_DEFAULT
              OR RTRIM(i_sub.codigo_pai) = CAST(p.codigoInterno AS VARCHAR) COLLATE DATABASE_DEFAULT
              OR (UPPER(TRIM(p.partNumber)) = 'SCF001' AND RTRIM(i_sub.codigo_pai) = '101235')
@@ -94,7 +94,7 @@ COMPOSICOES_MANUAIS_SCF = {
             "desc_insumo": "SEMIACABADO PRESUNTO FATIADO - 1,00KG - R",
             "peso_unid_kg": 0.028,
             "peso_lote_receita_kg": 1.0,
-            "unidade": "KG"
+            "unidade": "KG",
         },
         {
             "tipo": "SEMIACABADOS",
@@ -102,8 +102,8 @@ COMPOSICOES_MANUAIS_SCF = {
             "desc_insumo": "SEMIACABADO MUSSARELA FATIADA - 1,00KG - R",
             "peso_unid_kg": 0.014,
             "peso_lote_receita_kg": 1.0,
-            "unidade": "KG"
-        }
+            "unidade": "KG",
+        },
     ],
     "SCF002": [
         {
@@ -112,7 +112,7 @@ COMPOSICOES_MANUAIS_SCF = {
             "desc_insumo": "SEMIACABADO FRANGO DESFIADO - 1,00KG - R",
             "peso_unid_kg": 0.028,
             "peso_lote_receita_kg": 1.0,
-            "unidade": "KG"
+            "unidade": "KG",
         },
         {
             "tipo": "SEMIACABADOS",
@@ -120,10 +120,11 @@ COMPOSICOES_MANUAIS_SCF = {
             "desc_insumo": "SEMIACABADO MUSSARELA FATIADA - 1,00KG - R",
             "peso_unid_kg": 0.014,
             "peso_lote_receita_kg": 1.0,
-            "unidade": "KG"
-        }
-    ]
+            "unidade": "KG",
+        },
+    ],
 }
+
 
 def aplicar_composicoes_resilientes(codigo_caixa: str, composicoes):
     """Retorna composições do SQL ou um fallback manual para SCFs sem ficha."""
@@ -193,8 +194,9 @@ def executar_sincronizacao():
             )
 
         with open("fichas_tecnicas_scf.ndjson", "w", encoding="utf-8") as handle:
-            for produto in produtos:
-                handle.write(json.dumps(produto, ensure_ascii=False) + "\n")
+            handle.writelines(
+                json.dumps(produto, ensure_ascii=False) + "\n" for produto in produtos
+            )
 
         print(
             f"Sucesso! {len(produtos)} produtos sincronizados em 'fichas_tecnicas_scf.ndjson'."
