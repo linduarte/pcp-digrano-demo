@@ -234,7 +234,7 @@ def consultar_produtos():
 
 
 def calcular_ordem_duckdb(itens_op):
-    """Calcula a necessidade de insumos para a ordem de produção com base no DuckDB."""
+    """Calcula a necessidade de insumos para a ordem de produção com base no DuckDB com regra fixa imutável."""
     if not itens_op:
         return []
 
@@ -269,7 +269,7 @@ def calcular_ordem_duckdb(itens_op):
                 )
                 if not df_scf.empty:
                     return df_scf
-            except (AttributeError, TypeError, ValueError, duckdb.Error):
+            except AttributeError, TypeError, ValueError, duckdb.Error:
                 pass
 
         query_padrao = """
@@ -291,7 +291,7 @@ def calcular_ordem_duckdb(itens_op):
         """
         try:
             return estado_dados["con_duck"].execute(query_padrao, [cod_limpo]).df()
-        except (AttributeError, TypeError, ValueError, duckdb.Error):
+        except AttributeError, TypeError, ValueError, duckdb.Error:
             return pd.DataFrame()
 
     def _obter_total_unidades(item):
@@ -337,12 +337,20 @@ def calcular_ordem_duckdb(itens_op):
         unidade = str(row.get("unidade", "KG") or "KG").strip()
         linha = str(row.get("linha", "ENCAIXOTAMENTO") or "ENCAIXOTAMENTO").strip()
 
+        # Ignora registros que não são insumos de produção
         if not cod_insumo or cod_insumo.startswith("10") or desc_insumo == cod_insumo:
             return
 
         raw_peso = float(row.get("peso_unid_kg") or 0.0)
 
-        if total_unidades_caixa > 1 and raw_peso > 0.15:
+        # ---------------------------------------------------------------------
+        # ARCABOUÇO FIXO DE TRATAMENTO DE PESO UNITÁRIO
+        # Se o peso unitário cadastrado for superior ao peso de uma unidade física individual (> 0.20 KG),
+        # significa que a base cadastrou o peso referente à caixa inteira.
+        # Nesses casos dividimos por total_unidades_caixa. Para itens já unitários (ex: 0.075 KG da esfirra),
+        # mantemos o peso unitário direto sem alterar!
+        # ---------------------------------------------------------------------
+        if total_unidades_caixa > 1 and raw_peso > 0.20:
             peso_unid_kg = raw_peso / total_unidades_caixa
         else:
             peso_unid_kg = raw_peso
@@ -379,7 +387,6 @@ def calcular_ordem_duckdb(itens_op):
             num_lotes = 1.0
             total_bruto = nec_liq
 
-        # Retorna o texto limpo para o Quasar estilizar via template
         desc_exibida = (
             f"{item['desc_insumo']} (Soma de {qtd_prods} produtos)"
             if foi_somado
@@ -458,6 +465,32 @@ def main_page():
     # pylint: disable=too-many-locals,too-many-statements
     ui.colors(primary="#1E40AF", secondary="#0D9488", accent="#F59E0B", dark="#0F172A")
 
+    # Injeta o estilo CSS para forçar o negrito e a cor escura nas labels do Quasar
+    ui.add_head_html("""
+    <style>
+        /* Ajuste do tamanho e peso das labels para manter proporção */
+        .q-field__label {
+            font-weight: 700 !important;
+            font-size: 0.95rem !important;
+            color: #1e293b !important;
+        }
+
+        .q-field--float .q-field__label {
+            font-size: 0.90rem !important;
+            font-weight: 700 !important;
+            transform: translateY(-120%) scale(1) !important;
+        }
+
+        .q-field--labeled .q-field__native,
+        .q-field--labeled .q-field__prefix,
+        .q-field--labeled .q-field__suffix {
+            padding-top: 20px !important;
+        }
+    </style>
+    """)
+
+    # Restante do código da interface...
+
     with ui.header().classes(
         "bg-primary text-white p-4 items-center justify-between shadow-lg"
     ):
@@ -535,29 +568,43 @@ def main_page():
             ):
                 ui.label(
                     "1. Lançamento da Ordem de Produção (Intenção PCP Multi-Produto)"
-                ).classes("text-base font-bold text-slate-800 mb-3")
+                ).classes("text-xl font-extrabold text-slate-800 mb-2")
 
                 with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-                    select_prod = ui.select(
-                        options=dict_produtos,
-                        label="Selecione o Produto Final (Part Number)",
-                        value=list(dict_produtos.keys())[0] if dict_produtos else None,
-                        with_input=True,
-                    ).classes("w-96")
+                    select_prod = (
+                        ui.select(
+                            options=dict_produtos,
+                            label="Selecione o Produto Final (Part Number)",
+                            value=list(dict_produtos.keys())[0]
+                            if dict_produtos
+                            else None,
+                            with_input=True,
+                        )
+                        .classes("w-96")
+                        .props('input-class="text-base font-bold text-slate-900"')
+                    )
 
-                    input_cx = ui.number(
-                        label="Caixas (CX)", value=0, min=0, format="%.0f"
-                    ).classes("w-32")
-                    input_pct = ui.number(
-                        label="Pacotes (PCT)", value=0, min=0, format="%.0f"
-                    ).classes("w-32")
-                    input_und = ui.number(
-                        label="Unidades (UNI)", value=0, min=0, format="%.0f"
-                    ).classes("w-32")
+                    input_cx = (
+                        ui.number(label="Caixas (CX)", value=0, min=0, format="%.0f")
+                        .classes("w-32")
+                        .props('input-class="text-base font-bold text-slate-900"')
+                    )
+                    input_pct = (
+                        ui.number(label="Pacotes (PCT)", value=0, min=0, format="%.0f")
+                        .classes("w-32")
+                        .props('input-class="text-base font-bold text-slate-900"')
+                    )
+
+                    input_und = (
+                        ui.number(label="Unidades (UNI)", value=0, min=0, format="%.0f")
+                        .classes("w-32")
+                        .props('input-class="text-base font-bold text-slate-900"')
+                    )
 
                     # Card dinâmico para a Memória de Cálculo de Unidades
+                    # Card/Label da Memória de Cálculo com fonte maior e destaque
                     label_memoria = ui.label("").classes(
-                        "w-full text-xs font-mono text-primary font-bold mt-2 bg-blue-50 p-2 rounded border border-blue-200"
+                        "w-full text-sm font-mono text-blue-900 font-bold mt-2 bg-blue-100 p-3 rounded-lg border border-blue-300 shadow-sm"
                     )
 
                     def atualizar_preview_memoria():
@@ -684,56 +731,56 @@ def main_page():
                         ).classes("bg-primary text-white shadow-md")
 
                 colunas_tabela = [
-                {
-                    "name": "cod_insumo",
-                    "label": "Código",
-                    "field": "cod_insumo",
-                    "align": "left",
-                },
-                {
-                    "name": "desc_insumo",
-                    "label": "Descrição do Insumo",
-                    "field": "desc_insumo",
-                    "align": "left",
-                    "html": True,  # <--- CRÍTICO para permitir renderização de estilos inline
-                },
-                {
-                    "name": "linha",
-                    "label": "Linha",
-                    "field": "linha",
-                    "align": "left",
-                },
-                {
-                    "name": "lote_kg_str",
-                    "label": "Lote Padrão",
-                    "field": "lote_kg_str",
-                    "align": "right",
-                },
-                {
-                    "name": "unidade",
-                    "label": "Unidade",
-                    "field": "unidade",
-                    "align": "center",
-                },
-                {
-                    "name": "num_lotes",
-                    "label": "Nº Receitas (Regra 0.5)",
-                    "field": "num_lotes",
-                    "align": "right",
-                },
-                {
-                    "name": "total_bruto_str",
-                    "label": "Total bruto a preparar",
-                    "field": "total_bruto_str",
-                    "align": "right",
-                },
+                    {
+                        "name": "cod_insumo",
+                        "label": "Código",
+                        "field": "cod_insumo",
+                        "align": "left",
+                    },
+                    {
+                        "name": "desc_insumo",
+                        "label": "Descrição do Insumo",
+                        "field": "desc_insumo",
+                        "align": "left",
+                        "html": True,  # <--- CRÍTICO para permitir renderização de estilos inline
+                    },
+                    {
+                        "name": "linha",
+                        "label": "Linha",
+                        "field": "linha",
+                        "align": "left",
+                    },
+                    {
+                        "name": "lote_kg_str",
+                        "label": "Lote Padrão",
+                        "field": "lote_kg_str",
+                        "align": "right",
+                    },
+                    {
+                        "name": "unidade",
+                        "label": "Unidade",
+                        "field": "unidade",
+                        "align": "center",
+                    },
+                    {
+                        "name": "num_lotes",
+                        "label": "Nº Receitas (Regra 0.5)",
+                        "field": "num_lotes",
+                        "align": "right",
+                    },
+                    {
+                        "name": "total_bruto_str",
+                        "label": "Total bruto a preparar",
+                        "field": "total_bruto_str",
+                        "align": "right",
+                    },
                 ]
 
                 tabela = ui.table(
                     columns=colunas_tabela, rows=[], row_key="cod_insumo"
                 ).classes("w-full shadow-none border border-slate-200 rounded-lg")
 
-# Slot nativo do Quasar para renderizar a etiqueta em Azul Claro suave
+                # Slot nativo do Quasar para renderizar a etiqueta em Azul Claro suave
                 tabela.add_slot(
                     "body-cell-desc_insumo",
                     """
